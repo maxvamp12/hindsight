@@ -14260,6 +14260,7 @@ class MemoryEngine(MemoryEngineInterface):
         effective_budget = budget or Budget.LOW
         max_iterations = max(1, int(base_max_iterations * budget_multipliers.get(effective_budget, 1.0)))
         max_context_tokens = config.reflect_max_context_tokens
+        reflect_evidence_cap = config.reflect_max_evidence_tokens
         wall_timeout = config.reflect_wall_timeout
 
         # Run agentic loop - acquire connections only when needed for DB operations
@@ -14380,7 +14381,14 @@ class MemoryEngine(MemoryEngineInterface):
 
         async def expand_fn(memory_ids: list[str], depth: str) -> dict[str, Any]:
             async with backend.acquire() as conn:
-                return await tool_expand(conn, bank_id, memory_ids, depth)
+                return await tool_expand(
+                    conn,
+                    bank_id,
+                    memory_ids,
+                    depth,
+                    created_after=created_after,
+                    created_before=created_before,
+                )
 
         # Load directives from the dedicated directives table.
         # Directives are hard rules that must be followed in all responses.
@@ -14454,6 +14462,7 @@ class MemoryEngine(MemoryEngineInterface):
                         include_recall=include_recall,
                         budget=effective_budget,
                         max_context_tokens=max_context_tokens,
+                        max_evidence_tokens=reflect_evidence_cap,
                         llm_output_language=getattr(resolved_reflect_config, "llm_output_language", None),
                         cancel_check=request_context.raise_if_cancelled,
                         store_document_text=config_dict.get("store_document_text", DEFAULT_STORE_DOCUMENT_TEXT),
