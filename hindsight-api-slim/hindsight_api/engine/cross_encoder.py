@@ -157,7 +157,6 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         fp16: bool = False,
         bucket_batching: bool = False,
         batch_size: int = DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
-        allow_mps: bool = False,
     ):
         """
         Initialize local SentenceTransformers cross-encoder.
@@ -172,16 +171,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
             trust_remote_code: Allow loading models with custom code (security risk).
                               Required for some models like jina-reranker-v2-base-multilingual.
                               Default: False (disabled for security)
-            fp16: Use FP16 (half precision) inference. Faster on MPS and CUDA,
+            fp16: Use FP16 (half precision) inference. Faster on CUDA,
                   may be slower on CPU. Default: False (opt-in via env var).
             bucket_batching: Sort pairs by token length before batching to reduce
                             padding waste. 36-54% speedup, quality-identical.
                             Default: False (opt-in via env var).
             batch_size: Batch size for predict() calls. Optimal values vary by
-                       hardware and model (MPS: 32, CUDA: 128+). Default: 32.
-            allow_mps: Opt in to the Apple Silicon MPS GPU. Disabled by default
-                      because MPS leaks memory under variable-length workloads
-                      (see engine/local_device.py). Default: False
+                       hardware and model (CPU: 32, CUDA: 128+). Default: 32.
         """
         self.model_name = model_name or DEFAULT_RERANKER_LOCAL_MODEL
         self.force_cpu = force_cpu
@@ -189,7 +185,6 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         self.fp16 = fp16
         self.bucket_batching = bucket_batching
         self.batch_size = batch_size
-        self.allow_mps = allow_mps
         self._model = None
         self._device_type: str = "cpu"
         LocalSTCrossEncoder._max_concurrent = max_concurrent
@@ -222,8 +217,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         # cause issues when accelerate is installed but no GPU is available.
         # Note: We do NOT use device_map because CrossEncoder internally calls .to(device)
         # after loading, which conflicts with accelerate's device_map handling.
-        # MPS is opt-in (allow_mps) — see engine/local_device.py for why.
-        device = select_local_device(self.force_cpu, self.allow_mps)
+        # MPS is never used — see engine/local_device.py for why.
+        device = select_local_device(self.force_cpu)
 
         # Patch transformers 5.x compatibility for models using XLM-RoBERTa
         # (e.g., jina-reranker-v2-base-multilingual). transformers 5.x removed
@@ -1453,6 +1448,10 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
         # Device::end_encoding() crash with SIGSEGV (NULL deref).
         # Serialize all reranker inference through this lock.
         self._mlx_lock = threading.Lock()
+        # Picked up by release_local_inference_memory() below, which routes "mlx" to
+        # mx.clear_cache(). Without it MLX holds every freed Metal buffer for the life
+        # of the process.
+        self._device_type = "mlx"
         logger.info("Reranker: jina-mlx provider initialized")
 
     def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:
@@ -1467,13 +1466,18 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
         all_scores = [0.0] * len(pairs)
 
         with self._mlx_lock:
-            for query, indexed_docs in query_groups.items():
-                docs = [doc for _, doc in indexed_docs]
-                indices = [idx for idx, _ in indexed_docs]
-                results = self._reranker.rerank(query, docs)
-                for result in results:
-                    original_idx = result["index"]
-                    all_scores[indices[original_idx]] = result["relevance_score"]
+            try:
+                for query, indexed_docs in query_groups.items():
+                    docs = [doc for _, doc in indexed_docs]
+                    indices = [idx for idx, _ in indexed_docs]
+                    results = self._reranker.rerank(query, docs)
+                    for result in results:
+                        original_idx = result["index"]
+                        all_scores[indices[original_idx]] = result["relevance_score"]
+            finally:
+                # Inside the lock: MLX Metal ops are not thread-safe, which is why
+                # #1113 introduced _mlx_lock in the first place.
+                release_local_inference_memory(self._device_type)
 
         return all_scores
 
@@ -1865,7 +1869,6 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             fp16=member.local_fp16,
             bucket_batching=member.local_bucket_batching,
             batch_size=member.local_batch_size,
-            allow_mps=member.local_allow_mps,
         )
     elif provider == "cohere":
         api_key = member.cohere_api_key

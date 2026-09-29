@@ -19,6 +19,7 @@ read surfaces resolve them from there. The properties pinned here:
   is from the carried ids.
 """
 
+import base64
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -30,7 +31,15 @@ import pytest
 import hindsight_api.engine.memories as memories_module
 from hindsight_api.engine.chunk_ids import build_chunk_id
 from hindsight_api.engine.memories import set_memories
-from hindsight_api.engine.memories.base import META_ATTACHMENT_IDS, FactRecord, StoredMemory, build_fact_records
+from hindsight_api.engine.memories.base import (
+    DOC_META_ATTACHMENT_FILENAMES,
+    META_ATTACHMENT_IDS,
+    FactRecord,
+    StoredMemory,
+    build_fact_records,
+    document_attachment_filenames,
+    document_record_metadata,
+)
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.response_models import MemoryFact, RecallResult
 from hindsight_api.engine.retain.attachment_content import (
@@ -49,6 +58,7 @@ SHOT_HASH = compute_attachment_hash(b"the vpn reset screenshot")
 SHOT = short_attachment_id(SHOT_HASH)
 DIAGRAM = "0f1e2d3c4b5a"
 DOCUMENT_ID = "vpn-article"
+SHOT_NAME = "vpn-reset.png"
 
 
 # -- the write model ---------------------------------------------------------
@@ -99,6 +109,66 @@ def test_build_fact_records_carries_each_facts_attachment_ids():
     assert json.loads(records[0].metadata_bag()[META_ATTACHMENT_IDS]) == [SHOT]
 
 
+# -- the document record's names ---------------------------------------------
+
+
+def test_document_record_metadata_round_trips_the_names():
+    """The names are a JSON string in a string -> string map, next to the retain params."""
+    metadata = document_record_metadata({"context": "kb"}, {SHOT: SHOT_NAME, DIAGRAM: ""})
+
+    assert all(isinstance(v, str) for v in metadata.values())
+    assert json.loads(metadata["retain_params"]) == {"context": "kb"}
+    # An empty name is no name: it must not come back as a filename of "".
+    assert document_attachment_filenames({"metadata": metadata}) == {SHOT: SHOT_NAME}
+
+
+def test_document_record_metadata_omits_the_key_when_nothing_is_named():
+    assert document_record_metadata(None, {}) == {}
+    assert DOC_META_ATTACHMENT_FILENAMES not in document_record_metadata({"context": "kb"}, None)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [None, {}, {"metadata": {}}, {"metadata": {DOC_META_ATTACHMENT_FILENAMES: "{not json"}}],
+    ids=["absent", "no-metadata", "no-key", "unparseable"],
+)
+def test_a_record_without_readable_names_has_none(record):
+    """A record written before the key existed reads back exactly as it did: no names."""
+    assert document_attachment_filenames(record) == {}
+
+
+@pytest.mark.asyncio
+async def test_the_document_body_write_carries_the_names(monkeypatch):
+    """`_store_document_bodies` is the writer the delta, non-session and batched paths share."""
+    from hindsight_api.engine.retain import orchestrator
+
+    written: list[dict] = []
+
+    class _Store:
+        def store_owned_for(self, bank_id):
+            return True
+
+        async def put_document(self, **kwargs):
+            written.append(kwargs)
+
+    monkeypatch.setattr(memories_module, "get_memories", lambda: _Store())
+
+    await orchestrator._store_document_bodies(
+        bank_id="bank-1",
+        document_id=DOCUMENT_ID,
+        combined_content="body",
+        chunk_texts=["body"],
+        merged_tags=[],
+        config=SimpleNamespace(store_document_text=True),
+        content_hash="h",
+        retain_params={"context": "kb"},
+        attachment_filenames={SHOT: SHOT_NAME},
+    )
+
+    assert document_attachment_filenames(written[0]) == {SHOT: SHOT_NAME}
+    assert json.loads(written[0]["metadata"]["retain_params"]) == {"context": "kb"}
+
+
 # -- the engine lookup -------------------------------------------------------
 
 
@@ -125,6 +195,7 @@ class _AttachmentsOnlyConn:
             SHOT: ("h" * 64, "image/png", 10, "image"),
             DIAGRAM: ("d" * 64, "image/svg+xml", 20, "image"),
         }
+        # The name is on the row, per document: doc-1 named the screenshot, doc-2 did not.
         return [
             {
                 "attachment_hash": known[i][0],
@@ -133,7 +204,7 @@ class _AttachmentsOnlyConn:
                 "byte_size": known[i][2],
                 "storage_key": f"k/{i}",
                 "kind": known[i][3],
-                "filename": None,
+                "filename": SHOT_NAME if (i == SHOT and document_id == "doc-1") else None,
             }
             for i in ids
             if i in known
@@ -158,8 +229,87 @@ class _EngineWithConn:
         return _Backend()
 
 
-def _memories(store_owned: bool):
-    return SimpleNamespace(store_owned_for=lambda bank_id: store_owned)
+def _memories(store_owned: bool, names: "dict[str, dict[str, str]] | None" = None):
+    """A store stub. ``names`` is document_id -> attachment names on that document's record;
+    ``record_reads`` logs every batched record read, so a test can count them."""
+    record_reads: list[list[str]] = []
+
+    async def get_document_records(*, bank_id, document_ids):
+        record_reads.append(list(document_ids))
+        return {
+            d: {"document_id": d, "metadata": document_record_metadata(None, (names or {})[d])}
+            for d in document_ids
+            if d in (names or {})
+        }
+
+    return SimpleNamespace(
+        store_owned_for=lambda bank_id: store_owned,
+        get_document_records=get_document_records,
+        record_reads=record_reads,
+    )
+
+
+# -- reclaim -----------------------------------------------------------------
+
+
+class _ReclaimEngine:
+    """Enough of the engine for the reclaim path; its file storage fails on any delete."""
+
+    _unreferenced_attachment_blobs = MemoryEngine._unreferenced_attachment_blobs
+
+    class _Files:
+        async def delete(self, key):
+            raise AssertionError(f"reclaim deleted the blob {key}, which a row still names")
+
+    _file_storage = _Files()
+
+
+class _ReclaimConn:
+    """Answers the two reads the reclaim makes, and records the delete."""
+
+    def __init__(self, keys: list[str], still_named: "list[str] | None" = None):
+        self._keys = keys
+        self._still_named = still_named or []
+        self.deleted: list[tuple] = []
+
+    async def fetch(self, sql, *args):
+        if "DISTINCT storage_key" in sql:
+            return [{"storage_key": key} for key in self._still_named]
+        return [{"storage_key": key} for key in self._keys]
+
+    async def execute(self, sql, *args):
+        self.deleted.append(args)
+
+
+@pytest.mark.asyncio
+async def test_reclaim_runs_for_a_store_owned_bank():
+    """#4462: an attachment belongs to its document, so this is the same on both backends.
+
+    It used to bail out here. A store-owned bank's documents are not SQL rows, so it had no
+    reference rows, and "no reference survives" could not tell an unreferenced attachment from
+    one a store-held document still shows -- which meant nothing ever reclaimed these banks'
+    attachments. Now the attachment row names its own document, and there is nothing to ask.
+    """
+    conn = _ReclaimConn([f"k/{SHOT}"])
+
+    orphans = await MemoryEngine._drop_orphaned_attachments(_ReclaimEngine(), conn, "bank-1", DOCUMENT_ID)
+
+    assert orphans == [f"k/{SHOT}"]
+    assert conn.deleted == [("bank-1", DOCUMENT_ID)], "the document's own rows, and only those"
+
+
+@pytest.mark.asyncio
+async def test_reclaim_keeps_a_blob_another_row_still_names():
+    """A bank retained before this rule shares one blob across its documents.
+
+    The migration gives each document a row of its own but does not move the bytes, so the
+    surviving rows still name that key; freeing it with the first document would blank the
+    image in the others.
+    """
+    shared = f"legacy/{SHOT}"
+    conn = _ReclaimConn([shared], still_named=[shared])
+
+    assert await MemoryEngine._drop_orphaned_attachments(_ReclaimEngine(), conn, "bank-1", DOCUMENT_ID) == []
 
 
 @pytest.mark.asyncio
@@ -169,16 +319,20 @@ async def test_a_store_owned_bank_resolves_no_attachments_without_touching_postg
     The property is that the lookup returns before it asks for the bank profile or a connection,
     not merely that it returns ``{}``: an empty result is what the expensive read produced too.
     """
-    monkeypatch.setattr(memories_module, "get_memories", lambda: _memories(store_owned=True))
+    store = _memories(store_owned=True, names={"doc-1": {SHOT: SHOT_NAME}})
+    monkeypatch.setattr(memories_module, "get_memories", lambda: store)
 
     result = await MemoryEngine.attachments_for_memories(_NoPostgres(), "bank-1", [UNIT_A], request_context=None)
 
     assert result == {}
+    # Nor the store: a response with no attachments pays nothing for their names.
+    assert store.record_reads == []
 
 
 @pytest.mark.asyncio
 async def test_a_store_owned_bank_resolves_the_carried_ids_without_memory_units(monkeypatch):
-    monkeypatch.setattr(memories_module, "get_memories", lambda: _memories(store_owned=True))
+    store = _memories(store_owned=True, names={"doc-1": {SHOT: SHOT_NAME}})
+    monkeypatch.setattr(memories_module, "get_memories", lambda: store)
     conn = _AttachmentsOnlyConn()
 
     result = await MemoryEngine.attachments_for_memories(
@@ -200,8 +354,15 @@ async def test_a_store_owned_bank_resolves_the_carried_ids_without_memory_units(
         UNIT_B: [DIAGRAM],
     }
     assert result[UNIT_A][0].media_type == "image/png"
-    # One read per document: the filename lives on the document edge.
+    # One read per document: the filename is on that document's own attachment row.
     assert len(conn.statements) == 2
+    # So the same bytes named in doc-1 stay unnamed in doc-2...
+    assert {unit: [r.filename for r in records] for unit, records in result.items()} == {
+        UNIT_A: [SHOT_NAME, None],
+        UNIT_B: [None],
+    }
+    # ...and the store's document records are not read at all for them.
+    assert store.record_reads == []
 
 
 @pytest.mark.asyncio
@@ -227,6 +388,12 @@ class _CarryingStore(InMemoryMemories):
     def __init__(self, answers_full_recall: bool):
         super().__init__({})
         self.answers_full_recall = answers_full_recall
+        #: Every batched record read, so a test can count what a response cost.
+        self.record_reads: list[list[str]] = []
+
+    async def get_document_records(self, *, bank_id, document_ids):
+        self.record_reads.append(list(document_ids))
+        return await super().get_document_records(bank_id=bank_id, document_ids=document_ids)
 
     async def full_recall(self, request):
         if not self.answers_full_recall:
@@ -292,17 +459,23 @@ def restore_default_store():
     set_memories(None)
 
 
-async def _store_owned_bank(memory, request_context, answers_full_recall: bool) -> tuple[str, _CarryingStore]:
+async def _store_owned_bank(
+    memory, request_context, answers_full_recall: bool, *, with_attachment: bool = True
+) -> tuple[str, _CarryingStore]:
     bank_id = f"so-attach-{uuid.uuid4().hex[:8]}"
     store = _CarryingStore(answers_full_recall)
     set_memories(store)
+    # The document record, carrying the name its retain gave the screenshot -- where a store-owned
+    # bank keeps what `document_attachments.filename` holds for a SQL one.
+    await _seed_document(store, bank_id, keep_text=True)
     # The store owns the facts, never the bank row, so create it the way a retain would.
-    await memory.get_bank_profile(bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)
     backend = await memory._get_backend()
     async with backend.acquire() as conn:
         await _record_attachments(
             conn,
             bank_id,
+            DOCUMENT_ID,
             [
                 StoredAttachment(
                     attachment_hash=SHOT_HASH,
@@ -311,6 +484,7 @@ async def _store_owned_bank(memory, request_context, answers_full_recall: bool) 
                     byte_size=68,
                     storage_key=f"attachments/{bank_id}/{SHOT}",
                     kind="image",
+                    filename=SHOT_NAME,
                 )
             ],
         )
@@ -321,7 +495,7 @@ async def _store_owned_bank(memory, request_context, answers_full_recall: bool) 
         fact_type="world",
         document_id="vpn-article",
         created_at=now,
-        attachment_ids=[SHOT],
+        attachment_ids=[SHOT] if with_attachment else [],
     )
     store.rows[UNIT_PLAIN] = StoredMemory(
         unit_id=UNIT_PLAIN,
@@ -338,6 +512,8 @@ def _assert_shot(attachments, bank_id: str) -> None:
     assert [a["id"] for a in attachments] == [SHOT]
     assert attachments[0]["media_type"] == "image/png"
     assert attachments[0]["url"] == f"/v1/default/banks/{bank_id}/attachments/{SHOT}"
+    # The name the retain gave it, read back off the document's own attachment row.
+    assert attachments[0]["filename"] == SHOT_NAME
 
 
 @pytest.mark.asyncio
@@ -345,7 +521,7 @@ def _assert_shot(attachments, bank_id: str) -> None:
 async def test_recall_returns_the_attachments_the_store_carried(
     api_client, memory, request_context, restore_default_store, answers_full_recall
 ):
-    bank_id, _ = await _store_owned_bank(memory, request_context, answers_full_recall)
+    bank_id, store = await _store_owned_bank(memory, request_context, answers_full_recall)
 
     response = await api_client.post(
         f"/v1/default/banks/{bank_id}/memories/recall",
@@ -359,16 +535,44 @@ async def test_recall_returns_the_attachments_the_store_carried(
     assert by_id[UNIT_PLAIN].get("attachments") is None
     # The carrier stays internal: the payload is the same shape on either backend.
     assert all("attachment_ids" not in r for r in by_id.values())
+    # The names ride on the attachment rows the lookup already reads, so the store's document
+    # records cost nothing at all.
+    assert store.record_reads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answers_full_recall", [True, False], ids=["store-answered", "engine-fused"])
+async def test_a_response_with_no_attachments_reads_no_document_record(
+    api_client, memory, request_context, restore_default_store, answers_full_recall
+):
+    """The common case -- nothing on the page was drawn from an attachment -- costs nothing extra."""
+    bank_id, store = await _store_owned_bank(memory, request_context, answers_full_recall, with_attachment=False)
+
+    recall = await api_client.post(
+        f"/v1/default/banks/{bank_id}/memories/recall",
+        json={"query": "how do I reset the VPN", "types": ["world"], "limit": 10},
+    )
+    listed = await api_client.get(f"/v1/default/banks/{bank_id}/memories/list")
+    detail = await api_client.get(f"/v1/default/banks/{bank_id}/memories/{UNIT_A}")
+
+    for response in (recall, listed, detail):
+        assert response.status_code == 200, response.text
+    assert all(not r.get("attachments") for r in recall.json()["results"])
+    assert all(not m.get("attachments") for m in listed.json()["items"])
+    assert not detail.json().get("attachments")
+    assert store.record_reads == []
 
 
 @pytest.mark.asyncio
 async def test_list_and_get_return_the_attachments_the_store_carried(
     api_client, memory, request_context, restore_default_store
 ):
-    bank_id, _ = await _store_owned_bank(memory, request_context, answers_full_recall=True)
+    bank_id, store = await _store_owned_bank(memory, request_context, answers_full_recall=True)
 
     listed = await api_client.get(f"/v1/default/banks/{bank_id}/memories/list")
     detail = await api_client.get(f"/v1/default/banks/{bank_id}/memories/{UNIT_A}")
+    # The names are on the attachment rows; no document record is read for them.
+    assert store.record_reads == []
 
     assert listed.status_code == 200, listed.text
     items = {m["id"]: m for m in listed.json()["items"]}
@@ -422,6 +626,29 @@ async def test_a_store_owned_chunk_resolves_from_the_carried_text(monkeypatch):
     )
 
     assert {chunk: [r.short_id for r in records] for chunk, records in result.items()} == {"c0": [SHOT]}
+    # The name comes off doc-1's own attachment row, not from the store.
+    assert result["c0"][0].filename == SHOT_NAME
+
+
+@pytest.mark.asyncio
+async def test_a_store_owned_chunk_takes_its_documents_names(monkeypatch):
+    store = _memories(store_owned=True, names={"doc-1": {SHOT: SHOT_NAME}})
+    monkeypatch.setattr(memories_module, "get_memories", lambda: store)
+
+    result = await MemoryEngine.attachments_for_chunks(
+        _EngineWithConn(_NoChunkTableConn()),
+        "bank-1",
+        ["c0", "c1"],
+        request_context=None,
+        carried_texts={
+            "c0": ("doc-1", f"click {attachment_placeholder(SHOT_HASH)}"),
+            "c1": ("doc-1", f"again {attachment_placeholder(SHOT_HASH)}"),
+        },
+    )
+
+    assert [r.filename for r in result["c0"]] == [SHOT_NAME]
+    assert [r.filename for r in result["c1"]] == [SHOT_NAME]
+    assert store.record_reads == [], "the name is on the attachment row; the record is not read"
 
 
 async def _seed_document(store: _CarryingStore, bank_id: str, *, keep_text: bool) -> str:
@@ -432,6 +659,7 @@ async def _seed_document(store: _CarryingStore, bank_id: str, *, keep_text: bool
         content_hash="h",
         original_text=text if keep_text else None,
         chunk_texts=[text, "Then reconnect."],
+        metadata=document_record_metadata(None, {SHOT: SHOT_NAME}),
     )
     return text
 
@@ -441,16 +669,17 @@ async def test_document_and_chunk_reads_return_the_attachments_in_the_stored_tex
     api_client, memory, request_context, restore_default_store
 ):
     bank_id, store = await _store_owned_bank(memory, request_context, answers_full_recall=True)
-    await _seed_document(store, bank_id, keep_text=True)
 
     document = await api_client.get(f"/v1/default/banks/{bank_id}/documents/{DOCUMENT_ID}")
     chunks = await api_client.get(f"/v1/default/banks/{bank_id}/documents/{DOCUMENT_ID}/chunks")
     chunk = await api_client.get(f"/v1/default/chunks/{build_chunk_id(bank_id, DOCUMENT_ID, 0)}")
+    # Every one of them takes its attachments, names included, off the attachment rows.
+    assert store.record_reads == []
 
     assert document.status_code == 200, document.text
     _assert_shot(document.json().get("attachments"), bank_id)
-    # The filename lives on the document edge, which a store-owned bank cannot have.
-    assert document.json()["attachments"][0].get("filename") is None
+    # The carrier is taken off: the payload is the same shape on either backend.
+    assert "attachment_filenames" not in document.json()
 
     assert chunks.status_code == 200, chunks.text
     items = chunks.json()["items"]
@@ -463,15 +692,106 @@ async def test_document_and_chunk_reads_return_the_attachments_in_the_stored_tex
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keep_text", [True, False], ids=["full-text", "chunks-only"])
-async def test_the_retain_revisit_lookup_reads_the_stored_text(
+async def test_the_retain_revisit_lookup_reads_the_attachment_rows(
     memory, request_context, restore_default_store, keep_text
 ):
-    """The retain ingress asks which attachments a document already references, with no text in
-    hand, so that an edit re-sending its placeholders keeps them. For a store-owned bank the answer
-    comes from the stored text -- and from the chunk texts when the full text is not kept."""
+    """The retain ingress asks which attachments a document already carries, with no text in hand,
+    so that an edit re-sending its placeholders keeps them. The attachment row names its document,
+    so the answer is the same query on either backend -- and it does not depend on whether the
+    deployment keeps the document's full text."""
     bank_id, store = await _store_owned_bank(memory, request_context, answers_full_recall=True)
     await _seed_document(store, bank_id, keep_text=keep_text)
 
     existing = await memory.attachments_for_documents(bank_id, [DOCUMENT_ID, "never-retained"], request_context)
 
     assert {d: [r.short_id for r in records] for d, records in existing.items()} == {DOCUMENT_ID: [SHOT]}
+    # The name rides on the same row, which is what stops an edit from erasing it.
+    assert existing[DOCUMENT_ID][0].filename == SHOT_NAME
+    assert store.record_reads == []
+
+
+# -- the write side, through a real retain ----------------------------------
+
+PDF = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+PDF_ID = short_attachment_id(compute_attachment_hash(PDF))
+
+
+def _file_item(document_id: str, filename: str | None) -> dict:
+    block = {
+        "type": "file",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(PDF).decode()},
+    }
+    if filename:
+        block["filename"] = filename
+    return {"content": [{"type": "text", "text": "See the attached policy."}, block], "document_id": document_id}
+
+
+@pytest.mark.asyncio
+async def test_a_store_owned_retain_writes_the_names_onto_the_document_record(
+    api_client, memory, request_context, restore_default_store
+):
+    """The retain writes the map; the reads return it -- no SQL `document_attachments` row involved."""
+    bank_id = f"so-retain-{uuid.uuid4().hex[:8]}"
+    store = _CarryingStore(answers_full_recall=True)
+    set_memories(store)
+    assert (await api_client.put(f"/v1/default/banks/{bank_id}", json={})).status_code == 200
+    config = await api_client.patch(
+        f"/v1/default/banks/{bank_id}/config", json={"updates": {"retain_extraction_mode": "chunks"}}
+    )
+    assert config.status_code == 200, config.text
+
+    retained = await api_client.post(
+        f"/v1/default/banks/{bank_id}/memories",
+        json={"items": [_file_item("policy", "policy-v1.pdf")], "async": False},
+    )
+    assert retained.status_code == 200, retained.text
+
+    assert document_attachment_filenames(store.documents["policy"]) == {PDF_ID: "policy-v1.pdf"}
+    document = await api_client.get(f"/v1/default/banks/{bank_id}/documents/policy")
+    assert document.status_code == 200, document.text
+    assert [(a["id"], a["filename"]) for a in document.json()["attachments"]] == [(PDF_ID, "policy-v1.pdf")]
+
+
+@pytest.mark.asyncio
+async def test_a_store_owned_re_ingest_drops_the_attachment_its_text_no_longer_carries(
+    api_client, memory, request_context, restore_default_store
+):
+    """What a document carries is derived from its text, on both backends.
+
+    A bank whose documents live in SQL rewrites the rows from its document write. A store-owned
+    bank makes no such write, so the rewrite had nothing to hang off and never ran: the row -- and
+    the bytes behind it -- outlived every reference to them, and the document went on reporting an
+    attachment its text had stopped carrying.
+    """
+    bank_id = f"so-reingest-{uuid.uuid4().hex[:8]}"
+    store = _CarryingStore(answers_full_recall=True)
+    set_memories(store)
+    assert (await api_client.put(f"/v1/default/banks/{bank_id}", json={})).status_code == 200
+    config = await api_client.patch(
+        f"/v1/default/banks/{bank_id}/config", json={"updates": {"retain_extraction_mode": "chunks"}}
+    )
+    assert config.status_code == 200, config.text
+
+    retained = await api_client.post(
+        f"/v1/default/banks/{bank_id}/memories",
+        json={"items": [_file_item("policy", "policy-v1.pdf")], "async": False},
+    )
+    assert retained.status_code == 200, retained.text
+    carried = await api_client.get(f"/v1/default/banks/{bank_id}/documents/policy")
+    assert [a["id"] for a in carried.json()["attachments"]] == [PDF_ID]
+
+    re_ingested = await api_client.post(
+        f"/v1/default/banks/{bank_id}/memories",
+        json={"items": [{"content": "The policy is now plain text.", "document_id": "policy"}], "async": False},
+    )
+    assert re_ingested.status_code == 200, re_ingested.text
+
+    document = await api_client.get(f"/v1/default/banks/{bank_id}/documents/policy")
+    assert document.status_code == 200, document.text
+    assert not document.json().get("attachments")
+    # The row too, not only what the read renders: the row is what holds the storage key, so a row
+    # left behind is a blob nothing will ever reclaim.
+    backend = await memory._get_backend()
+    async with backend.acquire() as conn:
+        rows = await conn.fetch("SELECT short_id FROM attachments WHERE bank_id = $1", bank_id)
+    assert rows == []

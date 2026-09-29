@@ -1631,7 +1631,7 @@ def _register_create_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
             else:
                 # The public profile API owns bank creation and its lifecycle
                 # validation when no profile fields need updating.
-                profile = await memory.get_bank_profile(bank_id, request_context=request_context)
+                profile = await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
             # Serialize disposition if it's a Pydantic model
             if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
@@ -3819,6 +3819,8 @@ def _register_get_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsC
         )
         if result is None:
             raise _ToolError(f"Document '{document_id}' not found")
+        # An engine-internal carrier a store-owned bank's document has and a SQL one does not.
+        result.pop("attachment_filenames", None)
         return result
 
     if config.include_bank_id_param:
@@ -4183,7 +4185,6 @@ def _register_get_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfi
         profile = await memory.get_bank_profile(
             target_bank,
             request_context=_get_request_context(config),
-            create_if_missing=False,
         )
         if profile is None:
             raise _ToolError(f"Bank '{target_bank}' not found")

@@ -131,8 +131,63 @@ META_CONSOLIDATED_FLAG = "consolidated"
 #: provenance the extractor records. Carried on the memory so read surfaces can resolve
 #: it from the rows the store already returned, without a second lookup.
 META_ATTACHMENT_IDS = "attachment_ids"
+
+# Keys in a store-owned DOCUMENT record's metadata map (string -> string, so structured values
+# travel as one JSON string each). Unlike the memory bag above these describe the document, and
+# the same record read serves every one of them.
+#: The document's replayable retain parameters, as one JSON object.
+DOC_META_RETAIN_PARAMS = "retain_params"
+#: The names the caller gave this document's attachments, as a JSON object of short id ->
+#: filename. On the document rather than the fact because a filename describes the reference,
+#: not the bytes: the same image can be "diagram.png" in one document and "fig-2.png" in another.
+#: The authority is `attachments.filename`, written at the ingress on every backend; this is the
+#: store's own copy, which the paths that replay stored text restate their names from.
+DOC_META_ATTACHMENT_FILENAMES = "attachment_filenames"
+#: Where the document's original upload lives in Hindsight's ``file_storage`` — the key
+#: ``documents.file_storage_key`` holds for a bank whose documents live in SQL. The upload's name
+#: and content type ride on the record's own ``file_original_name`` / ``file_content_type``.
+DOC_META_FILE_STORAGE_KEY = "file_storage_key"
 CONSOLIDATED_NO = "0"
 CONSOLIDATED_YES = "1"
+
+
+def document_record_metadata(
+    retain_params: "dict | None", attachment_filenames: "Mapping[str, str] | None" = None
+) -> dict[str, str]:
+    """The metadata map a store-owned document record is written with.
+
+    One builder for every write path, because a path that forgets a key does not fail -- it
+    writes a record without it, and the key reads back as absent until the next full re-ingest.
+    The map REPLACES the record's previous one: a write carries every name the document should
+    keep, which is why the paths that re-send stored text (append, reprocess, an edit re-sending
+    placeholders) carry the names they read back with it.
+    """
+    out: dict[str, str] = {}
+    if retain_params:
+        out[DOC_META_RETAIN_PARAMS] = json.dumps(retain_params)
+    names = {str(k): str(v) for k, v in (attachment_filenames or {}).items() if k and v}
+    if names:
+        out[DOC_META_ATTACHMENT_FILENAMES] = json.dumps(names, sort_keys=True)
+    return out
+
+
+def document_attachment_filenames(record: "Mapping | None") -> dict[str, str]:
+    """A store-owned document record's attachment names (short id -> filename); ``{}`` if none.
+
+    Tolerant by design: a record written before the key existed, or one whose value does not
+    parse, has no names -- which reads back as a null ``filename``, exactly what it read before.
+    """
+    raw = ((record or {}).get("metadata") or {}).get(DOC_META_ATTACHMENT_FILENAMES)
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(k): str(v) for k, v in decoded.items() if k and v}
+
 
 #: Prefix for the per-source metadata key an observation carries, one per source.
 #: The forward list (:data:`META_SOURCE_MEMORY_IDS`) reads an observation's
@@ -1103,6 +1158,9 @@ class MemoriesExtension(Extension, ABC):
         search_query: "str | None" = None,
         tags: "list[str] | None" = None,
         tags_match: str = "any_strict",
+        time_field: str | None = None,
+        start_date: "datetime | None" = None,
+        end_date: "datetime | None" = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict:
@@ -1114,7 +1172,11 @@ class MemoriesExtension(Extension, ABC):
 
         ``tags``/``tags_match`` filter by the documents' tags with the same modes and meanings as
         anywhere else, and ``total`` must count what MATCHES — a page filtered after the fact would
-        report the unfiltered total and drop every match past the window."""
+        report the unfiltered total and drop every match past the window.
+
+        ``time_field`` (``created_at`` / ``updated_at``) with ``start_date``/``end_date`` is the
+        same window the SQL branch applies: half-open ``[start, end)`` on the named axis, which also
+        becomes the ordering. ``total`` counts the window, on the same terms as tags above."""
         raise NotImplementedError
 
     async def count_documents(self, *, bank_id: str) -> int:
@@ -1230,6 +1292,29 @@ class MemoriesExtension(Extension, ABC):
         Without it, `update_document(tags=...)` changed the memories' tags and left the document
         itself showing the old ones, which is the sort of half-applied edit that only surfaces in
         the browser a week later."""
+        raise NotImplementedError
+
+    async def set_document_file(
+        self,
+        *,
+        bank_id: str,
+        document_id: str,
+        storage_key: str,
+        original_name: str,
+        content_type: str,
+    ) -> bool:
+        """Record on a document RECORD the uploaded file it was converted from, leaving its bodies
+        alone. Returns ``False`` when the document does not exist.
+
+        Only a ``store_owned`` store implements this; a Postgres store keeps the reference on its
+        own ``documents`` row, so the engine calls it only for a store-owned bank. It is a separate
+        write because a file-convert retain learns the reference in its own task, after the retain
+        that wrote the record; without it the reference had nowhere to go and was silently dropped.
+
+        The storage key is a pointer into Hindsight's ``file_storage``, not bytes the store holds; it
+        goes in the record's metadata under :data:`DOC_META_FILE_STORAGE_KEY`. A later write that replaces the
+        document's content replaces the record, and with it the reference: the new content was not
+        converted from that file."""
         raise NotImplementedError
 
     async def delete_document_record(self, *, bank_id: str, document_id: str) -> None:
@@ -1692,6 +1777,9 @@ class MemoriesExtension(Extension, ABC):
         tags: list[str] | None = None,
         tags_match: str = "any",
         created_before: "datetime | None" = None,
+        time_field: str | None = None,
+        start_date: "datetime | None" = None,
+        end_date: "datetime | None" = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -1699,6 +1787,12 @@ class MemoriesExtension(Extension, ABC):
 
         ``total`` is the count matching the filters, not the page size, because
         the UI pages on it.
+
+        ``time_field`` / ``start_date`` / ``end_date`` are one time window: the
+        named axis filters AND orders, and memories with no value on it are left
+        out — so ``total`` can legitimately be 0 on a bank full of memories none
+        of which carry that timestamp. See :mod:`hindsight_api.engine.time_filter`
+        for the full contract a store must honour.
 
         A store that owns its rows puts each memory's attachment ids on its item as
         ``"attachment_ids": list[str]`` (see :data:`META_ATTACHMENT_IDS`). The HTTP

@@ -53,6 +53,7 @@ jobs:
       integrations-crewai: ${{ steps.filter.outputs.integrations-crewai }}
       integrations-litellm: ${{ steps.filter.outputs.integrations-litellm }}
       integrations-pydantic-ai: ${{ steps.filter.outputs.integrations-pydantic-ai }}
+      integrations-hermes: ${{ steps.filter.outputs.integrations-hermes }}
       integrations-ag2: ${{ steps.filter.outputs.integrations-ag2 }}
       integrations-autogen: ${{ steps.filter.outputs.integrations-autogen }}
       integrations-aider: ${{ steps.filter.outputs.integrations-aider }}
@@ -119,6 +120,12 @@ jobs:
             - 'hindsight-clients/python/**'
           clients-rust:
             - 'hindsight-clients/rust/**'
+            # The Rust client is not committed source — build.rs regenerates it with
+            # progenitor from this spec, and progenitor emits query params POSITIONALLY
+            # in alphabetical order. So adding one query param to any endpoint shifts
+            # every later argument and breaks the call sites, with nothing under
+            # hindsight-clients/rust/ changed to trigger this job (#4509).
+            - 'hindsight-docs/static/openapi.json'
           clients-go:
             - 'hindsight-clients/go/**'
           control-plane:
@@ -127,6 +134,9 @@ jobs:
             - 'package-lock.json'
           cli:
             - 'hindsight-cli/**'
+            # Same reason as clients-rust above: the CLI compiles against the
+            # progenitor-generated client, so an OpenAPI change alone can break it.
+            - 'hindsight-docs/static/openapi.json'
           docker:
             - 'docker/**'
           helm:
@@ -206,6 +216,8 @@ jobs:
             - 'hindsight-integrations/litellm/**'
           integrations-pydantic-ai:
             - 'hindsight-integrations/pydantic-ai/**'
+          integrations-hermes:
+            - 'hindsight-integrations/hermes/**'
           integrations-ag2:
             - 'hindsight-integrations/ag2/**'
           integrations-autogen:
@@ -1869,7 +1881,19 @@ jobs:
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      # gemini-3.1-flash-lite for this job only. Every test here asserts what the
+      # model chose to do, and 2.5-flash-lite is not reliable enough at the weakest
+      # of them to carry a gate: measured on this endpoint with the same prompt it
+      # kept a Japanese input in Japanese 3 times out of 10, against 10/10 for
+      # 3.1-flash-lite (test_retain_japanese_content, the largest single source of
+      # red runs here). The other jobs stay on 2.5-flash-lite — they exercise
+      # plumbing, not judgement.
+      #
+      # REGION: 3.1 is not served from us-central1 for this project (plain 404,
+      # "not found or your project does not have access"); the global endpoint
+      # serves it. us-east5 404s too, so this line is load-bearing.
+      HINDSIGHT_API_LLM_MODEL: google/gemini-3.1-flash-lite
+      HINDSIGHT_API_LLM_VERTEXAI_REGION: global
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # The real-LLM delta/retraction/cache evals gate on this flag *and* a key. The
       # key was already set here, so they sat skipped and the mental-model delta path —
@@ -4157,6 +4181,39 @@ jobs:
       working-directory: ./hindsight-integrations/pydantic-ai
       run: uv run pytest tests -v
 
+  test-hermes-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-hermes == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/hermes
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/hermes
+      run: uv run pytest tests -v
+
   test-langgraph-integration:
     needs: [detect-changes]
     if: >-
@@ -5607,6 +5664,7 @@ jobs:
       - test-superagent-integration
       - test-litellm-integration
       - test-pydantic-ai-integration
+      - test-hermes-integration
       - test-llamaindex-integration
       - test-openai-agents-integration
       - test-openhands-integration

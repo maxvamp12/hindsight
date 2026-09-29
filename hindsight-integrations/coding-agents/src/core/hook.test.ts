@@ -45,13 +45,9 @@ function makeClient(
     getPage: (pageId: string) => Promise<unknown>;
     searchKnowledgePages: (
       query: string,
-      limit: number,
-      timeoutMs?: number
+      opts?: { limit?: number; timeoutMs?: number }
     ) => Promise<{ id: string; name: string; snippet: string }[]>;
-    recallObservations: (
-      query: string,
-      opts: { maxTokens: number; timeoutMs: number }
-    ) => Promise<string[]>;
+    recallObservations: (query: string, opts: { timeoutMs: number }) => Promise<string[]>;
   }> = {}
 ) {
   return {
@@ -122,7 +118,10 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(client.reflect).not.toHaveBeenCalled();
-    expect(first.context).toBeUndefined();
+    // The guide is re-stated every turn now (pageRefreshEveryTurns defaults to
+    // 1), so context is never empty — what this test is about is that no MEMORY
+    // was injected on the deferred turn.
+    expect(first.context).not.toContain("<hindsight_memory>");
     expect(JSON.parse(readFileSync(cacheFile, "utf8")).deferInitialReflect).toBeUndefined();
 
     const second = await buildHookOutput({
@@ -151,7 +150,7 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     // Reflect failed -> no reflect block; pages are never auto-injected -> nothing to inject.
-    expect(t1.context).toBeUndefined();
+    expect(t1.context).not.toContain("<hindsight_memory>");
     // ...but the turn is NOT silent: one line pointing at the diag trail (#3443).
     expect(t1.notice).toContain("no memory this turn");
     expect(t1.notice).toContain(diagFilePath());
@@ -224,11 +223,11 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(result.notice).toBeUndefined();
-    expect(result.context).toBeUndefined();
+    expect(result.context).not.toContain("<hindsight_memory>");
   });
 
-  it("uses a bounded low-budget reflect and caps its timeout at 20000ms", async () => {
-    const cfg = resolveConfig({}); // reflectTimeoutMs default 120000
+  it("uses a bounded low-budget reflect with the 20000ms default timeout", async () => {
+    const cfg = resolveConfig({});
     const client = makeClient();
     await buildHookOutput({
       harness: "claude-code",
@@ -243,8 +242,9 @@ describe("buildHookOutput", () => {
     });
   });
 
-  it("uses the configured reflect timeout when it is below the 20s cap", async () => {
-    const cfg = resolveConfig({ reflectTimeoutMs: 5000 });
+  // #4398: a raised reflectTimeoutMs used to be silently clamped to a hardcoded 20s.
+  it.each([5000, 30000])("uses the configured reflect timeout as-is (%ims)", async (ms) => {
+    const cfg = resolveConfig({ reflectTimeoutMs: ms });
     const client = makeClient();
     await buildHookOutput({
       harness: "claude-code",
@@ -255,7 +255,7 @@ describe("buildHookOutput", () => {
     });
     expect(client.reflect).toHaveBeenCalledWith(buildReflectQuery("the prompt"), {
       budget: "low",
-      timeoutMs: 5000,
+      timeoutMs: ms,
     });
   });
 
@@ -281,11 +281,10 @@ describe("buildHookOutput", () => {
 
       const t1 = await buildHookOutput(args);
 
-      expect(client.searchKnowledgePages).toHaveBeenCalledWith(
-        MATCHING_PROMPT,
-        3,
-        expect.any(Number)
-      );
+      // No limit argument: it comes from the client's pageSearchLimit.
+      expect(client.searchKnowledgePages).toHaveBeenCalledWith(MATCHING_PROMPT, {
+        timeoutMs: expect.any(Number),
+      });
       expect(client.recallObservations).not.toHaveBeenCalled();
       expect(t1.context).toContain("<hindsight_memory>");
       expect(t1.context).toContain("- Upload retries (kp-1): 200ms jitter window");
@@ -321,10 +320,9 @@ describe("buildHookOutput", () => {
 
       expect(client.searchKnowledgePages).toHaveBeenCalledTimes(1);
       expect(client.recallObservations).toHaveBeenCalledWith(MATCHING_PROMPT, {
-        maxTokens: 2000,
         timeoutMs: expect.any(Number),
       });
-      expect(out.context).toContain("consolidated observations");
+      expect(out.context).toContain("recalled from the bank");
       expect(out.context).toContain("- Retries back off exponentially.\n- Tokens rotate daily.");
       expect(out.notice).toBeUndefined();
     });
@@ -367,7 +365,7 @@ describe("buildHookOutput", () => {
       });
 
       expect(client.recallObservations).toHaveBeenCalledTimes(1);
-      expect(out.context).toBeUndefined();
+      expect(out.context).not.toContain("<hindsight_memory>");
       expect(out.notice).toContain("no memory this turn");
       expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
     });
@@ -418,6 +416,71 @@ describe("buildHookOutput", () => {
       expect(events.find((e) => e.event === "reflect_fallback_pages")?.count).toBe(0);
       expect(events.find((e) => e.event === "reflect_fallback_observations")?.count).toBe(1);
     });
+  });
+
+  it("autoInject pages: injects page-search hits once, never reflects or recalls", async () => {
+    const client = makeClient({
+      searchKnowledgePages: vi.fn(async () => [
+        { id: "p1", name: "Uploader guide", snippet: "retry backoff 200ms jitter" },
+      ]),
+    });
+    const cfg = resolveConfig({ autoInject: "pages" });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg,
+      client,
+      cacheFile,
+    });
+    expect(client.reflect).not.toHaveBeenCalled();
+    expect(client.recallObservations).not.toHaveBeenCalled();
+    expect(out.context).toContain("<hindsight_memory>");
+    expect(out.context).toContain("Uploader guide (p1): retry backoff 200ms jitter");
+    expect(out.context).not.toContain("synthesis was unavailable");
+    expect(out.notice).toContain("Uploader guide");
+    const next = await buildHookOutput({
+      harness: "claude-code",
+      prompt: "next",
+      cfg,
+      client,
+      cacheFile,
+    });
+    expect(client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+    expect(next.context ?? "").not.toContain("<hindsight_memory>");
+  });
+
+  it("autoInject recall: injects recalled observations, never reflects or searches pages", async () => {
+    const client = makeClient({
+      recallObservations: vi.fn(async () => ["Uploads retry 3 times."]),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg: resolveConfig({ autoInject: "recall" }),
+      client,
+      cacheFile,
+    });
+    expect(client.reflect).not.toHaveBeenCalled();
+    expect(client.searchKnowledgePages).not.toHaveBeenCalled();
+    expect(out.context).toContain("- Uploads retry 3 times.");
+    expect(out.context).not.toContain("synthesis was unavailable");
+  });
+
+  it("autoInject pages/recall: an empty or failed retrieval injects nothing and no notice", async () => {
+    const client = makeClient({
+      recallObservations: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg: resolveConfig({ autoInject: "recall" }),
+      client,
+      cacheFile,
+    });
+    expect(out.context ?? "").not.toContain("<hindsight_memory>");
+    expect(out.notice).toBeUndefined();
   });
 
   it("autoReflect false: never calls reflect, injects no memory block", async () => {
@@ -499,7 +562,9 @@ describe("buildHookOutput", () => {
     });
     expect(result.context).toContain("REFLECT_ANSWER"); // reflect still injected
     expect(result.context).not.toContain(PAGES_HEADER);
-    expect(result.context).not.toContain("hindsight_read_knowledge_page");
+    // The tool NAME now appears in the every-turn guide, so the thing to assert
+    // is the absence of a page entry, not of the string.
+    expect(result.context).not.toContain("hindsight_read_knowledge_page p1");
   });
 
   it("injects the page-roster refresh only on cadence turns", async () => {
@@ -523,7 +588,7 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(t2.context).toContain("<hindsight_knowledge_refresh>");
-    expect(t2.context).toContain("Uploader guide (p1)");
+    expect(t2.context).toContain("deliberately NOT listed here");
     // reflect block is NOT re-injected on cadence turns (injected once, on the reflect turn)
     expect(t2.context).not.toContain("REFLECT_ANSWER");
   });

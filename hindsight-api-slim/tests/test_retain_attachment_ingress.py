@@ -5,7 +5,8 @@ Covers the contract and the storage seam, both deterministic:
 - a block-form item flattens to canonical placeholder text, and the raw bytes
   are committed content-addressed *before* anything is submitted, so no base64
   ever reaches the retain pipeline or an async operation's payload;
-- identical images dedupe to one blob and one row, across items and re-ingests;
+- identical images within one document dedupe to one blob and one row, across
+  items and re-ingests; a second document carrying the same image gets its own;
 - malformed, oversized and over-numerous images are the caller's error (400),
   named down to the offending item and block.
 
@@ -19,8 +20,8 @@ import uuid
 import pytest
 
 from hindsight_api.engine.retain.attachment_content import (
-    compute_attachment_hash,
     attachment_placeholder,
+    compute_attachment_hash,
     iter_placeholder_ids,
     short_attachment_id,
 )
@@ -58,34 +59,32 @@ async def _retain(client, bank_id: str, content, **item_fields):
     )
 
 
-async def _document_text(memory, bank_id: str, document_id: str) -> str:
-    """The exact canonical body retain stored.
+async def _document_text(client, bank_id: str, document_id: str) -> str:
+    """The exact canonical body retain stored, as the document API returns it.
 
-    Read straight from `documents` on purpose: the property under test is that
-    the placeholder text is byte-for-byte what the pipeline persists (that is
-    what content_hash idempotency keys on), and no engine read method exposes
-    the stored body verbatim.
+    The property under test is that the placeholder text is byte-for-byte what
+    the pipeline persists (that is what content_hash idempotency keys on).
+    ``original_text`` on get-document is that stored body verbatim on every
+    backend -- a SQL bank reads it from ``documents``, a store-owned bank from
+    the store's document record, where its ``documents`` column is NULL.
     """
-    backend = await memory._get_backend()
-    async with backend.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT original_text FROM documents WHERE id = $1 AND bank_id = $2",
-            document_id,
-            bank_id,
-        )
+    response = await client.get(f"/v1/default/banks/{bank_id}/documents/{document_id}")
+    assert response.status_code == 200, response.text
+    return response.json()["original_text"]
 
 
 async def _bank_attachment_rows(memory, bank_id: str) -> list[dict]:
     """The bank's stored image rows.
 
     Direct SQL because the assertion is about storage-layer state the public API
-    cannot express — that an image retained N times occupies exactly one row and
-    one content-addressed key.
+    cannot express — that an image a document carries N times occupies exactly one
+    row and one key, and that a second document carrying it gets its own.
     """
     backend = await memory._get_backend()
     async with backend.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT attachment_hash, short_id, media_type, byte_size, storage_key FROM attachments WHERE bank_id = $1",
+            "SELECT document_id, attachment_hash, short_id, media_type, byte_size, storage_key "
+            "FROM attachments WHERE bank_id = $1",
             bank_id,
         )
     return [dict(row) for row in rows]
@@ -113,7 +112,7 @@ async def test_image_block_becomes_a_placeholder_in_the_stored_document(api_clie
     )
     assert response.status_code == 200, response.text
 
-    stored = await _document_text(memory, bank_id, document_id)
+    stored = await _document_text(api_client, bank_id, document_id)
     expected_hash = compute_attachment_hash(PNG_BYTES)
     assert stored == (
         f"To reset the VPN, click the button shown:\n\n{attachment_placeholder(expected_hash)}\n\n...then reconnect."
@@ -135,32 +134,42 @@ async def test_image_bytes_are_stored_content_addressed_and_retrievable(api_clie
     assert rows[0]["attachment_hash"] == expected_hash
     assert rows[0]["media_type"] == "image/png"
     assert rows[0]["byte_size"] == len(PNG_BYTES)
-    assert rows[0]["storage_key"] == attachment_storage_key(bank_id, expected_hash)
+    assert rows[0]["storage_key"] == attachment_storage_key(bank_id, "d1", expected_hash)
 
     assert await memory._file_storage.retrieve(rows[0]["storage_key"]) == PNG_BYTES
 
 
 @pytest.mark.asyncio
-async def test_the_same_image_across_documents_is_stored_once(api_client, memory):
-    """Content-addressing is what makes re-ingesting a KB article cheap."""
+async def test_the_same_image_is_stored_once_per_document(api_client, memory):
+    """Dedup within a document, a copy per document.
+
+    Cross-document dedup is given up deliberately: it is the only reason a delete
+    would have to ask whether another document still needs the bytes, and that is
+    what cannot be answered for a bank whose documents live in a memories store.
+    """
     bank_id = f"img-{uuid.uuid4().hex[:8]}"
 
     for document_id in ("article-1", "article-2"):
         response = await _retain(
             api_client,
             bank_id,
-            [_text_block(f"body of {document_id}"), _image_block()],
+            # Twice in the one document: that dedupes to a single row.
+            [_text_block(f"body of {document_id}"), _image_block(), _text_block("again:"), _image_block()],
             document_id=document_id,
         )
         assert response.status_code == 200, response.text
 
     rows = await _bank_attachment_rows(memory, bank_id)
-    assert len(rows) == 1
+    assert {row["document_id"] for row in rows} == {"article-1", "article-2"}
+    assert len(rows) == 2, "one row per document, and one per document only"
+    assert len({row["storage_key"] for row in rows}) == 2, "each document holds its own copy of the bytes"
 
-    # Both documents still name it.
+    # Both documents still name it -- twice each, since that is what they were sent.
     for document_id in ("article-1", "article-2"):
-        text = await _document_text(memory, bank_id, document_id)
-        assert list(iter_placeholder_ids(text)) == [short_attachment_id(compute_attachment_hash(PNG_BYTES))]
+        text = await _document_text(api_client, bank_id, document_id)
+        ids = list(iter_placeholder_ids(text))
+        assert set(ids) == {short_attachment_id(compute_attachment_hash(PNG_BYTES))}
+        assert len(ids) == 2, "the text keeps every placeholder; it is the storage that dedupes"
 
 
 @pytest.mark.asyncio
@@ -194,11 +203,11 @@ async def test_re_retaining_identical_multimodal_content_is_idempotent(api_clien
 
     first = await _retain(api_client, bank_id, content, document_id="stable")
     assert first.status_code == 200, first.text
-    text_after_first = await _document_text(memory, bank_id, "stable")
+    text_after_first = await _document_text(api_client, bank_id, "stable")
 
     second = await _retain(api_client, bank_id, content, document_id="stable")
     assert second.status_code == 200, second.text
-    text_after_second = await _document_text(memory, bank_id, "stable")
+    text_after_second = await _document_text(api_client, bank_id, "stable")
 
     assert text_after_first == text_after_second
     assert len(await _bank_attachment_rows(memory, bank_id)) == 1
@@ -214,7 +223,7 @@ async def test_a_lone_text_block_is_identical_to_the_plain_string_form(api_clien
         await _retain(api_client, bank_id, [_text_block("Alice joined the AI team")], document_id="b")
     ).status_code == 200
 
-    assert await _document_text(memory, bank_id, "s") == await _document_text(memory, bank_id, "b")
+    assert await _document_text(api_client, bank_id, "s") == await _document_text(api_client, bank_id, "b")
 
 
 @pytest.mark.asyncio
@@ -304,7 +313,9 @@ async def test_an_image_alone_is_content_even_with_no_prose(api_client, memory):
     response = await _retain(api_client, bank_id, [_image_block()], document_id="bare")
 
     assert response.status_code == 200, response.text
-    assert await _document_text(memory, bank_id, "bare") == attachment_placeholder(compute_attachment_hash(PNG_BYTES))
+    assert await _document_text(api_client, bank_id, "bare") == attachment_placeholder(
+        compute_attachment_hash(PNG_BYTES)
+    )
 
 
 @pytest.mark.asyncio
@@ -323,7 +334,7 @@ async def test_plain_string_content_cannot_summon_an_image(api_client, memory):
     response = await _retain(api_client, bank_id, f"see {stolen} here", document_id="thief")
 
     assert response.status_code == 200, response.text
-    assert await _document_text(memory, bank_id, "thief") == "see  here"
+    assert await _document_text(api_client, bank_id, "thief") == "see  here"
 
 
 @pytest.mark.asyncio
@@ -336,14 +347,14 @@ async def test_editing_a_documents_text_keeps_its_own_attachments(api_client, me
     """
     bank_id = f"img-{uuid.uuid4().hex[:8]}"
     await _retain(api_client, bank_id, [_text_block("before:"), _image_block()], document_id="article")
-    stored = await _document_text(memory, bank_id, "article")
+    stored = await _document_text(api_client, bank_id, "article")
     assert list(iter_placeholder_ids(stored))
 
     edited = stored.replace("before:", "after the rewrite:")
     response = await _retain(api_client, bank_id, edited, document_id="article")
 
     assert response.status_code == 200, response.text
-    text = await _document_text(memory, bank_id, "article")
+    text = await _document_text(api_client, bank_id, "article")
     assert "after the rewrite:" in text
     assert list(iter_placeholder_ids(text)) == list(iter_placeholder_ids(stored))
 
@@ -353,10 +364,10 @@ async def test_the_exemption_is_scoped_to_the_document_that_owns_it(api_client, 
     """Document A's attachment must not be summonable from document B's text."""
     bank_id = f"img-{uuid.uuid4().hex[:8]}"
     await _retain(api_client, bank_id, [_text_block("owner"), _image_block()], document_id="owner")
-    owner_text = await _document_text(memory, bank_id, "owner")
+    owner_text = await _document_text(api_client, bank_id, "owner")
     stolen = f"see {owner_text.split(chr(10))[2]} here"
 
     response = await _retain(api_client, bank_id, stolen, document_id="thief")
 
     assert response.status_code == 200, response.text
-    assert not list(iter_placeholder_ids(await _document_text(memory, bank_id, "thief")))
+    assert not list(iter_placeholder_ids(await _document_text(api_client, bank_id, "thief")))
