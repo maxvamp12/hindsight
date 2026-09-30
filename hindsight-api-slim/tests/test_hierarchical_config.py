@@ -137,6 +137,7 @@ async def test_hierarchical_fields_categorization():
     assert "retain_strategies" in configurable
     assert "max_observations_per_scope" in configurable
     assert "observation_scope_limits" in configurable
+    assert "consolidation_strategies" in configurable
     assert "reflect_source_facts_max_tokens" in configurable
     assert "llm_gemini_safety_settings" in configurable
     assert "mcp_enabled_tools" in configurable
@@ -151,9 +152,10 @@ async def test_hierarchical_fields_categorization():
     assert "enable_reranking" in configurable
     assert "mental_model_min_refresh_interval_seconds" in configurable
     assert "knowledge_page_default_trigger" in configurable
+    assert "reflect_default_options" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 49
+    assert len(configurable) == 51
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials
@@ -799,7 +801,7 @@ async def test_config_get_bank_config_no_static_or_credential_fields_leak(memory
             assert field in config, f"Expected configurable field '{field}' missing from config"
 
         # Should have a small number of configurable fields (not hundreds)
-        assert len(config) < 50, f"Too many fields returned: {len(config)}"
+        assert len(config) < 60, f"Too many fields returned: {len(config)}"
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)

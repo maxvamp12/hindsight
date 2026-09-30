@@ -59,9 +59,15 @@ import type {
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
   CreateMentalModelResponse,
+  Base64AttachmentSource,
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  DryRunExtractRequest,
+  DryRunExtractionResult,
+  ExtractedFact,
+  ExtractedFactAttachment,
+  ExtractionChunk,
   KnowledgeNode,
   KnowledgePageBundleResponse,
   KnowledgePageResponse,
@@ -250,6 +256,12 @@ export interface MentalModelTriggerOptions {
   includeChunks?: boolean;
   recallMaxTokens?: number;
   recallChunksMaxTokens?: number;
+  /** Token budget for the refresh's search_observations calls. Omit for the shipped 5000. */
+  reflectSearchObservationsMaxTokens?: number;
+  /** Whether search_observations attaches resolved entity names, which can be over half the tool payload. Omit for enabled. */
+  reflectSearchObservationsIncludeEntities?: boolean;
+  /** How many agent steps a refresh may spend, as a multiple of the server's reflect iteration limit: 'low' halves it, 'mid' keeps it, 'high' doubles it. Omit for 'mid'. */
+  budget?: "low" | "mid" | "high";
   /** JSON Schema for structured output, stored alongside the markdown content. */
   responseSchema?: Record<string, unknown>;
   /** Record how each refresh reached its result under reflect_response.trace. */
@@ -281,6 +293,9 @@ function toTriggerBody(trigger: MentalModelTriggerOptions): MentalModelTriggerIn
     include_chunks: trigger.includeChunks,
     recall_max_tokens: trigger.recallMaxTokens,
     recall_chunks_max_tokens: trigger.recallChunksMaxTokens,
+    reflect_search_observations_max_tokens: trigger.reflectSearchObservationsMaxTokens,
+    reflect_search_observations_include_entities: trigger.reflectSearchObservationsIncludeEntities,
+    budget: trigger.budget,
     response_schema: trigger.responseSchema,
     keep_trace: trigger.keepTrace,
   };
@@ -618,6 +633,10 @@ export class HindsightClient {
       excludeMentalModels?: boolean;
       /** Exclude specific mental models by ID from reflection. */
       excludeMentalModelIds?: string[];
+      /** Token budget for the agent's search_observations calls. Omit to use the bank's reflect_default_options, then the shipped default. */
+      reflectSearchObservationsMaxTokens?: number;
+      /** Whether search_observations attaches resolved entity names, which can be over half the tool payload. Omit to use the bank default (enabled). */
+      reflectSearchObservationsIncludeEntities?: boolean;
       /** If true, the response includes a 'based_on' field listing the memories, mental models, and directives used. */
       includeFacts?: boolean;
       /** If true, the response includes a 'trace' field with the tool calls and LLM calls made during reflection (trace.tool_calls / trace.llm_calls). */
@@ -653,6 +672,9 @@ export class HindsightClient {
             fact_types: options?.factTypes,
             exclude_mental_models: options?.excludeMentalModels,
             exclude_mental_model_ids: options?.excludeMentalModelIds,
+            reflect_search_observations_max_tokens: options?.reflectSearchObservationsMaxTokens,
+            reflect_search_observations_include_entities:
+              options?.reflectSearchObservationsIncludeEntities,
             include,
           },
           signal: options?.signal,
@@ -905,6 +927,7 @@ export class HindsightClient {
       maxObservationsPerScope?: number;
       /** Per-scope observation caps, overriding maxObservationsPerScope. */
       observationScopeLimits?: Record<string, unknown>[];
+      consolidationStrategies?: Record<string, unknown>[];
       /** Consolidate automatically after retain() rather than on demand. */
       enableAutoConsolidation?: boolean;
       /** Number of LLM calls to batch during consolidation. */
@@ -921,6 +944,8 @@ export class HindsightClient {
       mentalModelMinRefreshIntervalSeconds?: number;
       /** Trigger fields merged over the built-in default for new knowledge pages. */
       knowledgePageDefaultTrigger?: Record<string, unknown>;
+      /** Default reflect options for this bank, applied whenever a reflect request (or a mental model's trigger) leaves the option unset: reflect_search_observations_max_tokens, reflect_search_observations_include_entities. */
+      reflectDefaultOptions?: Record<string, unknown>;
       /** Token budget for source facts during reflect. -1 disables. */
       reflectSourceFactsMaxTokens?: number;
       /** Token budget for facts returned by recall. */
@@ -1002,6 +1027,8 @@ export class HindsightClient {
       updates.max_observations_per_scope = options.maxObservationsPerScope;
     if (options.observationScopeLimits !== undefined)
       updates.observation_scope_limits = options.observationScopeLimits;
+    if (options.consolidationStrategies !== undefined)
+      updates.consolidation_strategies = options.consolidationStrategies;
     if (options.enableAutoConsolidation !== undefined)
       updates.enable_auto_consolidation = options.enableAutoConsolidation;
     if (options.consolidationLlmBatchSize !== undefined)
@@ -1020,6 +1047,8 @@ export class HindsightClient {
         options.mentalModelMinRefreshIntervalSeconds;
     if (options.knowledgePageDefaultTrigger !== undefined)
       updates.knowledge_page_default_trigger = options.knowledgePageDefaultTrigger;
+    if (options.reflectDefaultOptions !== undefined)
+      updates.reflect_default_options = options.reflectDefaultOptions;
     if (options.reflectSourceFactsMaxTokens !== undefined)
       updates.reflect_source_facts_max_tokens = options.reflectSourceFactsMaxTokens;
     if (options.recallMaxTokens !== undefined) updates.recall_max_tokens = options.recallMaxTokens;
@@ -1745,51 +1774,7 @@ export class HindsightClient {
       signal: options?.signal,
     });
     const submission = this.validateResponse(submitResponse, "exportDocuments");
-    const operationId = submission.operation_id;
-
-    const pollInterval = options?.pollIntervalMs ?? 2000;
-    const timeout = options?.timeoutMs ?? 300000;
-    const deadline = Date.now() + timeout;
-    let resultMetadata: Record<string, unknown> | null | undefined;
-    for (;;) {
-      const statusResponse = await sdk.getOperationStatus({
-        client: this.client,
-        path: { bank_id: bankId, operation_id: operationId },
-        signal: options?.signal,
-      });
-      const status = this.validateResponse(statusResponse, "getOperationStatus");
-      if (status.status === "completed") {
-        resultMetadata = status.result_metadata;
-        break;
-      }
-      if (status.status === "failed" || status.status === "cancelled") {
-        throw new HindsightError(
-          `Export operation ${operationId} ${status.status}: ${status.error_message ?? ""}`
-        );
-      }
-      if (Date.now() >= deadline) {
-        throw new HindsightError(
-          `Export operation ${operationId} did not complete within ${timeout}ms`
-        );
-      }
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-    }
-
-    const downloadUrl = (resultMetadata as { download_url?: string } | null | undefined)
-      ?.download_url;
-    if (!downloadUrl) {
-      throw new HindsightError(`Export operation ${operationId} completed without a download_url`);
-    }
-    // Fetch the server-provided download_url directly (it carries the raw,
-    // slash-bearing storage key). Going through the templated `downloadFile`
-    // would percent-encode the slashes, which fronting proxies often reject.
-    const downloadResponse = await this.client.get({
-      url: downloadUrl,
-      parseAs: "arrayBuffer",
-      signal: options?.signal,
-    });
-    const data = this.validateResponse(downloadResponse as { data?: ArrayBuffer }, "downloadFile");
-    return new Uint8Array(data);
+    return this.downloadOperationArchive(bankId, submission.operation_id, options);
   }
 
   /**
@@ -1962,6 +1947,15 @@ export class HindsightClient {
     if (!downloadUrl) {
       throw new HindsightError(`Export operation ${operationId} completed without a download_url`);
     }
+    if (/^https?:\/\//i.test(downloadUrl)) {
+      // Signed object-store URLs need their own request: the API client prefixes
+      // its base URL and forwards Hindsight credentials to every request.
+      const response = await fetch(downloadUrl, { signal: options?.signal });
+      if (!response.ok) {
+        throw new HindsightError(`downloadFile failed: HTTP ${response.status}`, response.status);
+      }
+      return new Uint8Array(await response.arrayBuffer());
+    }
     // Fetch the server-provided download_url directly (it carries the raw,
     // slash-bearing storage key). Going through the templated `downloadFile`
     // would percent-encode the slashes, which fronting proxies often reject.
@@ -2022,6 +2016,10 @@ export function recallResponseToPromptString(response: RecallResponse): string {
 
 // Re-export types for convenience
 export type {
+  Base64AttachmentSource,
+  TextContentBlock,
+  ImageContentBlock,
+  FileContentBlock,
   RetainRequest,
   RetainResponse,
   RecallRequest,
@@ -2052,6 +2050,11 @@ export type {
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  DryRunExtractRequest,
+  DryRunExtractionResult,
+  ExtractedFact,
+  ExtractedFactAttachment,
+  ExtractionChunk,
   KnowledgeNode,
   KnowledgePageBundleResponse,
   KnowledgePageResponse,

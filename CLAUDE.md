@@ -124,7 +124,7 @@ uv run run-amb --dataset longmemeval --split s -- --category single-session-user
 
 ### Core Engine (hindsight-api-slim/hindsight_api/engine/)
 - `memory_engine.py`: Main orchestrator for retain/recall/reflect operations
-- `llm_wrapper.py`: LLM abstraction supporting OpenAI, Anthropic, Gemini, VertexAI, Groq, MiniMax, Ollama, LM Studio, LiteLLM, Claude Code, GitHub Copilot, DeepSeek, Fireworks, Codex (openai-codex), xAI (xai-oauth), Llama.cpp, Nous, etc. (See `hindsight-docs/docs/developer/configuration.md` for full provider lists)
+- `llm_wrapper.py`: LLM abstraction supporting OpenAI, Anthropic, Gemini, VertexAI, Groq, MiniMax, Ollama, LM Studio, LiteLLM, Claude Code, GitHub Copilot, DeepSeek, Fireworks, Codex (openai-codex), xAI (xai-oauth), Llama.cpp, Nous, etc. (See `hindsight-docs/docs/developer/configuration.mdx` for full provider lists)
 - `embeddings.py`: Embedding generation supporting local (SentenceTransformers) and standalone/remote providers (in-process: onnx; remote: tei, openai, cohere, zeroentropy, litellm, google, etc.)
 - `cross_encoder.py`: Reranking supporting local (CrossEncoder) and standalone/remote providers (in-process: flashrank, jina-mlx; remote: tei, cohere, siliconflow, zeroentropy, litellm, google, alibaba, etc.)
 - `entity_resolver.py`: Entity extraction and normalization
@@ -342,11 +342,12 @@ document it retains, so the control plane can show its logo instead of another
 - tag `harness:<id>` — the same value, so the documents list can filter on it
 
 The ids are defined by that integration's HookSpecs
-(`src/harness/hook-lifecycle.ts`, 11 harnesses) and persistent-plugin
+(`src/harness/hook-lifecycle.ts`, 13 harnesses) and persistent-plugin
 entrypoints (`src/harness/registry.ts`, 7 harnesses):
 currently `antigravity-cli`, `claude-code`, `cline-cli`, `codex`, `copilot-cli`,
 `cursor-cli`, `dcode`, `devin-cli`, `dsh`, `factory-droid`, `grok-build`,
-`kilo`, `opencode`, `opencode2`, `pi`, `prime-agent`, `qwen-code`, `zcode`.
+`kilo`, `kimi-code`, `opencode`, `opencode2`, `pi`, `prime-agent`, `qwen-code`,
+`traecode`, `zcode`.
 
 The control plane resolves the value in
 `hindsight-control-plane/src/lib/harness-logo.ts` (metadata wins over the tag) and
@@ -376,6 +377,24 @@ the agent-only half (tools, crediting, corrections) lives in `skill-src/preamble
 `src/docs-freshness.test.ts` fails on a stale skill or an undocumented `RawConfig` field. Run
 `./scripts/hooks/lint.sh` BEFORE regenerating — prettier re-pads the README's tables, and a
 generated file built from unformatted source fails the byte comparison in CI.
+
+### Hermes docs are generated from one README
+
+Same arrangement, one generator: `hindsight-integrations/hermes/README.md` is the single source for
+the Hermes integration page. **Never edit `hindsight-docs/docs-integrations/hermes.md` by hand** —
+it is generated:
+
+```bash
+node hindsight-docs/scripts/sync-hermes-doc.mjs                  # README -> docs page
+```
+
+The docs build runs the same script with `--check`, so a stale page fails the build. Sections listed
+in the script's `DROP_SECTIONS` (currently `Development`) stay repo-only, which is where
+maintainer-facing notes belong — anything else in the README ships to the public page.
+
+Shipping a change to that directory reaches no user until the Hermes plugin catalog pin moves: open
+a follow-up PR against `NousResearch/hermes-agent` bumping `sha` and `version` together in
+`plugin-catalog/hindsight.yaml`.
 
 ### Adding New Integrations
 
@@ -437,7 +456,7 @@ Fields must be categorized as either **hierarchical** (can be overridden per-ten
    value = config.my_static_field
    ```
 
-5. **Documentation** (`hindsight-docs/docs/developer/configuration.md`):
+5. **Documentation** (`hindsight-docs/docs/developer/configuration.mdx`):
    - Add to appropriate section table with Variable, Description, Default
    - Mark if it's hierarchical (can be overridden per-bank)
 
@@ -489,7 +508,7 @@ Common server settings:
 - `HINDSIGHT_CP_DATAPLANE_API_URL`: Control Plane backend URL (default: `http://localhost:8888`)
 
 LLM settings:
-- `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, deepseek, groq, minimax, ollama, lmstudio, fireworks, openai-codex, xai-oauth, etc. (See `hindsight-docs/docs/developer/configuration.md` for full provider lists)
+- `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, deepseek, groq, minimax, ollama, lmstudio, fireworks, openai-codex, xai-oauth, etc. (See `hindsight-docs/docs/developer/configuration.mdx` for full provider lists)
 - `HINDSIGHT_API_LLM_API_KEY`: API key for providers that require one
 - `HINDSIGHT_API_LLM_MODEL`: Model name (defaults are provider-specific)
 

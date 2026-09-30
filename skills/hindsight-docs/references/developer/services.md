@@ -1,6 +1,31 @@
+
 # Services
 
 Hindsight consists of three services that can run together or separately depending on your deployment needs.
+
+**Figure: Services.** An animated diagram on the docs site; its narration, step by step:
+
+- **retain · async**
+  1. A retain is slow work: an LLM has to read it. With async=true the API does not do it in the request.
+  2. It writes a task row into async_operations — the queue is just a table in the same database.
+  3. And answers right away with the operation id.
+  4. Every worker polls the table (every 500 ms). The claim locks the row, so exactly one worker gets it — the others skip it.
+  5. The worker calls the LLM to extract facts and embeds them.
+  6. Then writes them to the bank.
+  7. The task is marked completed. New facts queue their own follow-up: consolidation (when auto-consolidation is on), plus graph and index upkeep.
+  8. The Control Plane talks to the same API, so you can watch the operation there.
+- **background**
+  1. Background work goes through the same queue. This time worker-2 wins the claim.
+  2. Consolidation asks the LLM to merge new facts into observations.
+  3. Mental models that refresh after consolidation — and are now stale — get a refresh task of their own.
+  4. The API’s internal worker claims from the same table. Set HINDSIGHT_API_WORKER_ENABLED=false and only dedicated workers do.
+  5. Any worker can run any task: they share the package, the image and the database, so you add more to scale.
+- **recall · sync**
+  1. Later, a recall. Like reflect and any read, it is answered inside the API process. Nothing is queued.
+  2. The query is embedded — by a model loaded in the process itself, or a remote embeddings service.
+  3. The four searches run as queries against PostgreSQL, where every bank lives.
+  4. Candidates are reranked by the cross-encoder, local or remote like the embeddings.
+  5. The API keeps no state of its own, so you can run as many copies as you like behind a load balancer.
 
 ## API Service
 
@@ -48,11 +73,11 @@ hindsight-worker --worker-id worker-2
 
 Each worker exposes `/health/live` (liveness, no database access), `/health` and
 `/health/ready` (readiness, checks the database), and `/metrics` for monitoring.
-See [Monitoring - Health Endpoints](./monitoring#health-endpoints).
+See [Monitoring - Health Endpoints](./monitoring.md#health-endpoints).
 
 Before scaling down or removing workers, release their tasks with `hindsight-admin decommission-worker <worker-id>`.
 
-See [Configuration - Distributed Workers](./configuration#distributed-workers) for all worker settings and [Installation - Helm](./installation#distributed-workers) for Kubernetes deployment.
+See [Configuration - Distributed Workers](./configuration.md#distributed-workers) for all worker settings and [Installation - Helm](./installation.md#distributed-workers) for Kubernetes deployment.
 
 ## Control Plane
 
@@ -65,4 +90,4 @@ Web UI for managing and exploring your memory banks:
 
 The Control Plane connects to the API service and provides a visual interface for development and debugging.
 
-For bare metal deployments, you can run the Control Plane standalone using npx. See [Installation - Bare Metal](./installation#control-plane) for details.
+For bare metal deployments, you can run the Control Plane standalone using npx. See [Installation - Bare Metal](./installation.md#control-plane) for details.

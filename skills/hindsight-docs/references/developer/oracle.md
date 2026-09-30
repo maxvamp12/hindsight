@@ -13,7 +13,7 @@ PostgreSQL.
 :::info When to use Oracle
 Oracle is the right choice when your organization already runs Oracle and needs
 Hindsight to live inside that footprint. For everything else, the default
-PostgreSQL backend is simpler to operate — see [Storage](./storage) for the
+PostgreSQL backend is simpler to operate — see [Storage](./storage.md) for the
 rationale. Oracle and PostgreSQL are configured independently; you pick one per
 deployment.
 :::
@@ -142,17 +142,35 @@ Example:
 oracle+oracledb://hindsight:s3cret@db.internal:1521/ORCLPDB1
 ```
 
-:::warning Connection support: Easy Connect only
-Hindsight builds the Oracle connection from the URL as a plain
-`host:port/service_name` descriptor. **Wallet-based mTLS, TLS/TCPS, and TNS
-aliases or full connect descriptors are not currently supported** by the
-connection layer. In practice:
+#### Full connect descriptors and TNS aliases
 
-- **Oracle Autonomous Database** and other services that require a wallet /
-  mTLS are not supported as-is — connect to a database reachable over a direct
-  `host:port/service` listener.
-- The driver does not negotiate TLS itself, so secure the connection at the
-  network layer (private networking, VPN, or a TLS-terminating proxy).
+The form above is Easy Connect, which can only express `host:port/service`. When you
+need more — Autonomous Database over TCPS, `retry_count`, `ssl_server_dn_match`, or a
+TNS alias from a `tnsnames.ora` — leave the host empty and pass the descriptor as a
+`dsn` query parameter:
+
+```
+oracle+oracledb://USER:PASSWORD@/?dsn=DESCRIPTOR_OR_TNS_ALIAS
+```
+
+The descriptor has to be percent-encoded, like the password. For example, the
+Autonomous Database descriptor
+
+```
+(description=(retry_count=20)(address=(protocol=tcps)(port=1522)(host=adb.example.com))(connect_data=(service_name=abc_low))(security=(ssl_server_dn_match=yes)))
+```
+
+becomes
+
+```bash
+export HINDSIGHT_API_DATABASE_URL="oracle+oracledb://hindsight:s3cret@/?dsn=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read().strip()))' <<< '(description=(retry_count=20)(address=(protocol=tcps)(port=1522)(host=adb.example.com))(connect_data=(service_name=abc_low))(security=(ssl_server_dn_match=yes)))')"
+```
+
+:::warning Wallet-based mTLS is still not supported
+Hindsight passes no wallet directory or wallet password to the driver, so
+connections that require a wallet (mTLS) do not work. TCPS with
+`ssl_server_dn_match` does. Otherwise secure the connection at the network layer
+(private networking, VPN, or a TLS-terminating proxy).
 :::
 
 ### 3. Configure Hindsight
@@ -177,7 +195,7 @@ the schema user you created in step 1, spelled exactly as Oracle stores it —
 lower-case name.
 :::
 
-See [Configuration → Database](./configuration#database) for the full list of
+See [Configuration → Database](./configuration.md#database) for the full list of
 database variables.
 
 ### 4. Run migrations
@@ -218,7 +236,7 @@ should show your Oracle host and confirm the Oracle backend is active.
 ## Configuration reference
 
 Oracle-relevant settings, all documented in full on the
-[Configuration](./configuration) page:
+[Configuration](./configuration.md) page:
 
 | Variable | Purpose |
 |----------|---------|
@@ -261,7 +279,7 @@ internal details differ:
 
 ## See also
 
-- [Storage](./storage) — why PostgreSQL is the default, and how Oracle fits in
-- [Configuration](./configuration#database) — all database environment variables
-- [Installation](./installation) — packaging and deployment options
-- [Admin CLI](./admin-cli) — administrative commands (PostgreSQL-only data operations)
+- [Storage](./storage.md) — why PostgreSQL is the default, and how Oracle fits in
+- [Configuration](./configuration.md#database) — all database environment variables
+- [Installation](./installation.md) — packaging and deployment options
+- [Admin CLI](./admin-cli.md) — administrative commands (PostgreSQL-only data operations)

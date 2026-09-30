@@ -7,6 +7,7 @@ even know it exists. Three environment variables point the real server here:
     HINDSIGHT_API_LLM_BASE_URL                  -> /v1/chat/completions
     HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL    -> /v1/embeddings
     HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL -> /rerank
+    HINDSIGHT_API_RERANKER_TYPESAFE_BASE_URL     -> /v1/systemone
 
 Which means the tests exercise the production provider code for real — the
 OpenAI client, the JSON-repair path, the retry and rate-limit handling, the
@@ -25,7 +26,7 @@ from fastapi.responses import JSONResponse
 
 from .lexical import EMBEDDING_DIMENSION
 from .rulebook import ChatRequest, ReceivedWebhook, Stubs
-from .validation import RequestRejected, validate_chat, validate_embeddings, validate_rerank
+from .validation import RequestRejected, validate_chat, validate_embeddings, validate_rerank, validate_systemone
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,13 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
                 code="no_stub_rule",
             )
 
+        # Parked after resolve, so the call is already recorded and its rule already
+        # matched: from the story's side the step has happened and its operation is
+        # running, only the answer is outstanding.
+        held = stubs.llm.hold_for(chat_request)
+        if held is not None:
+            await held.park()
+
         return JSONResponse(
             {
                 "id": "chatcmpl-stub",
@@ -74,7 +82,12 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
                 "choices": [
                     {"index": 0, "message": reply.message, "finish_reason": reply.finish_reason, "logprobs": None}
                 ],
-                "usage": _usage(chat_request.all_text, str(reply.message.get("content") or "")),
+                "usage": _usage(
+                    chat_request.all_text,
+                    str(reply.message.get("content") or ""),
+                    visible_tokens=reply.visible_tokens,
+                    reasoning_tokens=reply.reasoning_tokens,
+                ),
             }
         )
 
@@ -118,6 +131,44 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
         )
         return JSONResponse({"received": True})
 
+    @app.post("/v1/systemone")
+    async def systemone(request: Request) -> JSONResponse:
+        """TypeSafe's typed-question endpoint.
+
+        Two question types reach it. A ``choice`` whose options are the candidates
+        is the ranking: every option gets a probability, and they sum to 1, so the
+        stub scores each option's text lexically and normalises. A ``score`` is the
+        cut: its answer is a level, and the rulebook decides which one.
+        """
+        body = await request.json()
+        validate_systemone(body)
+
+        answers = {}
+        for question_id, question in body["questions"].items():
+            if question["type"] == "choice":
+                criteria = question["criteria"]
+                scores = {
+                    key: stubs.rerank.score(body["state"], text if isinstance(text, str) else str(text))
+                    for key, text in criteria.items()
+                }
+                total = sum(scores.values()) or 1.0
+                probabilities = {key: value / total for key, value in scores.items()}
+                best = max(probabilities, key=lambda key: probabilities[key])
+                answers[question_id] = {
+                    "type": "choice",
+                    "choice": best,
+                    "probabilities": probabilities,
+                    "confidence": probabilities[best],
+                }
+            else:
+                answers[question_id] = {
+                    "type": "score",
+                    "score": float(stubs.rerank.cut_level),
+                    "legend": dict(enumerate(question["criteria"])),
+                    "confidence": 0.9,
+                }
+        return JSONResponse({"model": body.get("model", "stub"), "answers": answers, "usage": {"input_tokens": 1, "output_tokens": 1}})
+
     @app.post("/rerank")
     async def rerank(request: Request) -> JSONResponse:
         body = await request.json()
@@ -134,14 +185,19 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
     return app
 
 
-def _usage(prompt: str, completion: str) -> dict[str, int]:
+def _usage(
+    prompt: str, completion: str, *, visible_tokens: int | None = None, reasoning_tokens: int = 0
+) -> dict[str, int | dict[str, int]]:
     prompt_tokens = max(1, len(prompt.split()))
-    completion_tokens = max(1, len(completion.split()))
-    return {
+    completion_tokens = visible_tokens if visible_tokens is not None else max(1, len(completion.split()))
+    usage: dict[str, int | dict[str, int]] = {
         "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "completion_tokens": completion_tokens + reasoning_tokens,
+        "total_tokens": prompt_tokens + completion_tokens + reasoning_tokens,
     }
+    if reasoning_tokens:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    return usage
 
 
 def _provider_error(message: str, *, code: str) -> JSONResponse:

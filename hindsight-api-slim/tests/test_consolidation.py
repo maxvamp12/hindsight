@@ -3251,3 +3251,164 @@ async def test_create_observation_populates_search_vector_native(memory, request
     assert row["search_vector"] is not None, "search_vector must be populated for BM25 retrieval under native backend"
 
     await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_consolidation_strategy_source_facts_limits_reach_the_scope_recall(memory: MemoryEngine, request_context):
+    """A consolidation strategy's source-facts token limits apply to its scope's pass.
+
+    The limits are consumed by the related-observation recall, which used to resolve
+    the bank config on its own — so a per-scope override would have been silently
+    ignored there while the mission beside it applied. This runs a real fan-out
+    consolidation and checks what each scope's recall was actually given.
+    """
+    bank_id = f"test-strategy-sf-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    bank_defaults = await memory._config_resolver.resolve_full_config(bank_id, request_context)
+    await memory.update_bank_config(
+        bank_id,
+        {
+            "consolidation_strategies": [
+                {
+                    "scopes": [{"tags": ["company:*"]}],
+                    "consolidation_source_facts_max_tokens": 777,
+                    "consolidation_source_facts_max_tokens_per_observation": 77,
+                }
+            ]
+        },
+        request_context=request_context,
+    )
+
+    try:
+        with patch.object(memory, "recall_async", wraps=memory.recall_async) as mock_recall:
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[
+                    {
+                        "content": "Dana met the Northwind founders; they are moving to open-weight models.",
+                        "tags": ["user:dana", "company:acme"],
+                        "observation_scopes": [["user:dana"], ["company:acme"]],
+                    }
+                ],
+                request_context=request_context,
+            )
+
+        limits_by_scope = {
+            tuple(call.kwargs["tags"]): (
+                call.kwargs["max_source_facts_tokens"],
+                call.kwargs["max_source_facts_tokens_per_observation"],
+            )
+            for call in mock_recall.call_args_list
+            if call.kwargs.get("fact_type") == ["observation"] and call.kwargs.get("tags")
+        }
+
+        assert limits_by_scope[("company:acme",)] == (777, 77)
+        assert limits_by_scope[("user:dana",)] == (
+            bank_defaults.consolidation_source_facts_max_tokens,
+            bank_defaults.consolidation_source_facts_max_tokens_per_observation,
+        ), "a scope no strategy claims keeps the bank-wide limits"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def test_action_source_fact_ids_drop_repeats():
+    """A looping model can repeat one fact id thousands of times (#4799); keep each once, in order."""
+    from hindsight_api.engine.consolidation.consolidator import _CreateAction, _UpdateAction
+
+    ids = ["a"] * 1000 + ["b", "a", "c"]
+    assert _CreateAction(text="t", source_fact_ids=ids).source_fact_ids == ["a", "b", "c"]
+    assert _UpdateAction(text="t", observation_id="o", source_fact_ids=ids).source_fact_ids == ["a", "b", "c"]
+    assert _CreateAction(text="t", source_fact_ids="a").source_fact_ids == ["a"]
+
+
+def test_build_observations_for_llm_shows_each_source_once():
+    """Rows written before #4799 may repeat ids; the prompt must not repeat the fact text per copy."""
+    from hindsight_api.engine.consolidation.consolidator import _build_observations_for_llm
+    from hindsight_api.engine.response_models import MemoryFact
+
+    obs = MemoryFact(id="obs", text="Alice hikes.", fact_type="observation", source_fact_ids=["f1"] * 3000 + ["f2"])
+    facts = {fid: MemoryFact(id=fid, text=f"fact {fid}", fact_type="experience") for fid in ("f1", "f2")}
+
+    [serialized] = _build_observations_for_llm([obs], facts)
+
+    assert serialized["proof_count"] == 2
+    assert [m["text"] for m in serialized["source_memories"]] == ["fact f1", "fact f2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_repeated_source_ids_are_stored_once(memory: MemoryEngine, request_context):
+    """Repeated ids in an LLM create/update, and duplicates already on the row, are stored once (#4799)."""
+    import re
+
+    from hindsight_api.engine.consolidation.consolidator import (
+        _ConsolidationBatchResponse,
+        _CreateAction,
+        _UpdateAction,
+    )
+    from hindsight_api.engine.providers.mock_llm import MockLLM
+
+    bank_id = f"test-dup-src-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    obs_id = None
+
+    def callback(messages, scope):
+        if scope != "consolidation":
+            return _ConsolidationBatchResponse()
+        prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
+        if not fact_ids:
+            return _ConsolidationBatchResponse()
+        if obs_id is None:
+            return _ConsolidationBatchResponse(
+                creates=[_CreateAction(text="Alice hikes.", source_fact_ids=[fact_ids[0]] * 50)]
+            )
+        return _ConsolidationBatchResponse(
+            updates=[
+                _UpdateAction(
+                    text="Alice hikes and runs trails.",
+                    observation_id=str(obs_id),
+                    source_fact_ids=[fact_ids[0]] * 50,
+                )
+            ]
+        )
+
+    mock_llm = MockLLM(provider="mock", api_key="", base_url="", model="mock-model")
+    mock_llm.set_response_callback(callback)
+    wrapper = MagicMock()
+    wrapper.with_config.return_value = mock_llm
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        async with memory._pool.acquire() as conn:
+            [first] = await _insert_memories_with_tags(conn, bank_id, ["Alice loves hiking."])
+        await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        [obs] = (await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context))[
+            "items"
+        ]
+        assert obs["source_memory_ids"] == [str(first)]
+        assert obs["proof_count"] == 1
+        obs_id = obs["id"]
+
+        async with memory._pool.acquire() as conn:
+            # Forge a row written before the fix (one source repeated many times);
+            # no public API can produce this state any more.
+            await conn.execute(
+                "UPDATE memory_units SET source_memory_ids = $1, proof_count = 200 WHERE id = $2",
+                [first] * 200,
+                uuid.UUID(obs_id),
+            )
+            [second] = await _insert_memories_with_tags(conn, bank_id, ["Alice runs on trails."])
+        await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        [obs] = (await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context))[
+            "items"
+        ]
+        assert "trails" in obs["text"]
+        assert obs["source_memory_ids"] == [str(first), str(second)]
+        assert obs["proof_count"] == 2
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)

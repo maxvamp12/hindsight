@@ -2,7 +2,7 @@
 
 ![Hindsight Banner](./hindsight-docs/static/img/hindsight-github-banner.png)
 
-[Documentation](https://hindsight.vectorize.io) • [Integrations](https://hindsight.vectorize.io/integrations) • [Cookbook](https://hindsight.vectorize.io/cookbook) • [Benchmarks](https://benchmarks.hindsight.vectorize.io/) • [Paper](https://arxiv.org/abs/2512.12818) • [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup)
+[Documentation](https://hindsight.vectorize.io) • [Integrations](https://hindsight.vectorize.io/integrations) • [Cookbook](https://hindsight.vectorize.io/cookbook) • [Benchmarks](https://benchmarks.hindsight.vectorize.io/) • [Paper](https://arxiv.org/abs/2512.12818) • [Hindsight Cloud](https://ui.hindsight.vectorize.io)
 
 [![Release](https://github.com/vectorize-io/hindsight/actions/workflows/release.yml/badge.svg)](https://github.com/vectorize-io/hindsight/actions/workflows/release.yml)
 [![Version](https://img.shields.io/pypi/v/hindsight-api?logo=python&logoColor=white&label=version&color=blue)](https://pypi.org/project/hindsight-api/)
@@ -79,7 +79,7 @@ docker run -it --pull always --name hindsight --restart unless-stopped -p 8888:8
 >API: http://localhost:8888
 >UI: http://localhost:9999
 
-Hindsight works with **25+ LLM providers** via `HINDSIGHT_API_LLM_PROVIDER` — hosted (`openai`, `anthropic`, `gemini`, `groq`, `bedrock`, `vertexai`, `minimax`, `deepseek`, `atlas`, `meta`, …), fully local (`ollama`, `lmstudio`, `llamacpp`), any OpenAI-compatible endpoint, and gateways (`litellm`, `litellmrouter`) that reach the rest. Existing subscriptions work too: `openai-codex` (ChatGPT Plus/Pro), `claude-code` (Claude Pro/Max) and `github-copilot` (GitHub Copilot) need no API key. See [supported models](https://hindsight.vectorize.io/developer/models).
+Hindsight works with **25+ LLM providers** via `HINDSIGHT_API_LLM_PROVIDER` — hosted (`openai`, `anthropic`, `gemini`, `groq`, `bedrock`, `vertexai`, `minimax`, `deepseek`, `atlas`, `meta`, …), fully local (`ollama`, `lmstudio`, `llamacpp`), any OpenAI-compatible endpoint, and gateways (`litellm`, `litellmrouter`) that reach the rest. Existing subscriptions work too: `openai-codex` (ChatGPT Plus/Pro), `claude-code` (Claude Pro/Max), `cursor` (Cursor) and `github-copilot` (GitHub Copilot) need no API key. See [supported models](https://hindsight.vectorize.io/developer/models).
 
 #### Docker (external PostgreSQL)
 
@@ -114,7 +114,7 @@ helm install hindsight oci://ghcr.io/vectorize-io/charts/hindsight \
 
 [Hindsight Cloud](https://vectorize.io/pricing) is the hosted option: managed infrastructure that scales automatically, plus a dashboard, backups, team collaboration and a 99.9% uptime SLA. Billing is usage-based with free credits to start — no fixed monthly or per-seat fee. Point any client at `https://api.hindsight.vectorize.io` with your API key and skip the deployment entirely.
 
-[Compare self-hosted, Cloud and Enterprise →](https://vectorize.io/pricing) · [Sign up →](https://ui.hindsight.vectorize.io/signup)
+[Compare self-hosted, Cloud and Enterprise →](https://vectorize.io/pricing) · [Sign up →](https://ui.hindsight.vectorize.io)
 
 All options, including Windows and air-gapped setups, are covered in the [installation guide](https://hindsight.vectorize.io/developer/installation).
 
@@ -302,7 +302,7 @@ client.retain(
 
 Behind the scenes, retain uses an LLM to extract key facts, temporal data, entities, and relationships. It passes these through a normalization process to transform extracted data into canonical entities, time series, and search indexes along with metadata. These representations create the pathways for accurate memory retrieval in the recall and reflect operations.
 
-![Retain Operation](hindsight-docs/static/img/retain-operation.webp)
+<video src="https://github.com/user-attachments/assets/0555177d-6635-467d-97cb-9dcddb999b15" controls muted></video>
 
 [Retain docs →](https://hindsight.vectorize.io/developer/retain)
 
@@ -321,7 +321,7 @@ Recall performs 4 retrieval strategies in parallel:
 - Graph: Entity/temporal/causal links
 - Temporal: Time range filtering
 
-![Recall Operation](hindsight-docs/static/img/recall-operation.webp)
+<video src="https://github.com/user-attachments/assets/1c02eac8-1c5a-4e42-9a00-7201d44975a0" controls muted></video>
 
 The individual results are merged, ordered by relevance using reciprocal rank fusion and a cross-encoder reranking model, then trimmed as needed to fit within the token limit.
 
@@ -341,7 +341,7 @@ For example, reflect supports use cases such as:
 - A **Sales Agent** reflecting on why certain outreach messages have gotten responses while others haven't.
 - A **Support Agent** reflecting on opportunities where customers have questions not answered by current product documentation.
 
-![Reflect Operation](hindsight-docs/static/img/reflect-operation.webp)
+<video src="https://github.com/user-attachments/assets/1dd8aa20-5ad0-4536-823e-0fadf8051d57" controls muted></video>
 
 [Reflect docs →](https://hindsight.vectorize.io/developer/reflect)
 

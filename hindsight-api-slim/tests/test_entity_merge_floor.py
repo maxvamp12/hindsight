@@ -244,3 +244,161 @@ def test_single_word_names_are_exempt_from_word_level_agreement():
     reject real variants with no long shared word to hide behind."""
     assert _tokens_are_compatible("nick", "nicolas"), "0.55 by sequence ratio — under the word cutoff"
     assert _tokens_are_compatible("iran", "iraq"), "not compatible in truth, but not this rule's job"
+
+
+def test_names_with_different_numbers_are_not_compatible():
+    """101/102 is 0.67 by sequence ratio, over the word cutoff, so a different number passed as a
+    typo. Single-word names are not exempt from this rule."""
+    assert not _tokens_are_compatible("room 101", "room 102")
+    assert not _tokens_are_compatible("boeing 737", "boeing 747")
+    assert not _tokens_are_compatible("2023 tax return", "2024 tax return")
+    assert not _tokens_are_compatible("ua123", "ua124"), "single word"
+    assert _tokens_are_compatible("gpt-4", "gpt 4"), "the same number"
+    assert _tokens_are_compatible("ua0123", "ua123"), "leading zeros do not count"
+    assert _tokens_are_compatible("python", "python 3"), "a number on one side is left to the word check"
+    assert not _tokens_are_compatible("room 101 building 2", "room 102 building 2"), "one number differs"
+
+
+def test_a_name_and_its_more_numbered_form_are_left_to_the_word_check():
+    """Exact number equality split a name from its more specific form. When one name's numbers are a
+    subset of the other's, the word check decides."""
+    assert _tokens_are_compatible("q3 earnings", "q3 2024 earnings")
+    assert _tokens_are_compatible("boeing 737 max", "boeing 737 max 8")
+
+
+def test_decimal_number_variants_remain_compatible():
+    assert _tokens_are_compatible("version 1.0", "version 1")
+    assert _tokens_are_compatible("gpt-4.0", "gpt-4")
+    assert _tokens_are_compatible("python 3.0", "python 3")
+    assert _tokens_are_compatible("gpt-4.00", "gpt-4")
+    assert not _tokens_are_compatible("gpt-4.5", "gpt-45")
+    assert not _tokens_are_compatible("host 192.168.1.0", "host 192.168.1")
+
+
+def test_nonzero_decimal_parts_stay_distinct():
+    assert not _tokens_are_compatible("python 3.1", "python 3.10")
+    assert not _tokens_are_compatible("v1.1", "v1.10")
+    assert not _tokens_are_compatible("python 3.10", "python 3.100")
+    assert not _tokens_are_compatible("gpt-4.50", "gpt-4.5")
+
+
+@pytest.mark.asyncio
+async def test_a_different_number_is_not_merged_onto_a_recent_entity():
+    """Room 102 against a Room 101 seen today. The name term gives 0.44 and same-day recency adds
+    0.2, so the pair cleared the 0.6 cutoff with no shared context at all."""
+    name = await _resolve_one(
+        _resolver({"room 102": "new-room-102-id"}),
+        "Room 102",
+        ("room-101-id", "Room 101", {}, NOW, 3),
+        nearby=[],
+        cooccurs_with=set(),
+    )
+    assert name == "Room 102"
+
+
+@pytest.mark.asyncio
+async def test_decimal_number_variant_merges_onto_a_recent_entity():
+    name = await _resolve_one(
+        _resolver({"gpt-4.0": "new-gpt-4.0-id"}),
+        "GPT-4.0",
+        ("gpt-4-id", "GPT-4", {}, NOW, 3),
+        nearby=[],
+        cooccurs_with=set(),
+    )
+    assert name == "GPT-4"
+
+
+@pytest.mark.asyncio
+async def test_different_decimal_versions_do_not_merge_onto_a_recent_entity():
+    name = await _resolve_one(
+        _resolver({"python 3.10": "new-python-3.10-id"}),
+        "Python 3.10",
+        ("python-3.1-id", "Python 3.1", {}, NOW, 3),
+        nearby=[],
+        cooccurs_with=set(),
+    )
+    assert name == "Python 3.10"
+
+
+async def _resolve_new_names(names: list[str]) -> list[str]:
+    """Resolve several brand-new names arriving in ONE retain, and report the entity each got.
+
+    No candidates, so every name goes down the create path and the in-batch clustering pass is
+    what decides how many entities the batch ends up with. Only the connection and the INSERT are
+    doubles; the clustering itself is the real code.
+    """
+    resolver = _resolver({name.lower(): f"id-{name.lower()}" for name in names})
+    resolved = await resolver._resolve_from_candidates(
+        conn=AsyncMock(),
+        bank_id="bank-1",
+        entities_data=[{"text": name, "nearby_entities": [], "event_date": NOW} for name in names],
+        unit_event_date=NOW,
+        all_candidates=dict.fromkeys(names, []),
+        cooccurrence_map={},
+    )
+    return [entity.canonical_name for entity in resolved]
+
+
+@pytest.mark.asyncio
+async def test_a_different_given_name_is_not_absorbed_by_a_shared_surname_in_the_same_batch():
+    """The same rule as the existing-entity path above, on the path that runs before it.
+
+    In-batch clustering merged on trigram similarity alone, and one long shared word carries a
+    pair right over the 0.5 bar: "Dr John Richardson"/"Dr Jane Richardson" is 0.65. So two people
+    who share a surname were one entity when a single retain named them both and two entities when
+    separate retains did, which is the asymmetry #3107 set out to remove.
+    """
+    assert await _resolve_new_names(["Dr John Richardson", "Dr Jane Richardson"]) == [
+        "Dr John Richardson",
+        "Dr Jane Richardson",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_substituted_qualifier_does_not_collapse_two_records_in_the_same_batch():
+    """Not only people: "Q3 revenue report"/"Q4 revenue report" is 0.78 by trigram, and the one
+    word that distinguishes them is the short one."""
+    assert await _resolve_new_names(["Q3 revenue report", "Q4 revenue report"]) == [
+        "Q3 revenue report",
+        "Q4 revenue report",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_same_batch_surface_variants_of_one_name_still_collapse():
+    """The word check gates substitutions; it is not a tightening of in-batch dedup. Every
+    multi-word variant #3107 exists to collapse agrees word by word and still reaches one entity.
+    """
+    assert await _resolve_new_names(["Dr Wall", "Dr Waler"]) == ["Dr Wall", "Dr Wall"], "typo"
+    assert await _resolve_new_names(["Microsoft Corp", "Microsoft Corporation"]) == [
+        "Microsoft Corp",
+        "Microsoft Corp",
+    ], "abbreviation, via prefix"
+    assert await _resolve_new_names(["Ann Arbor", "Ann Arbour"]) == ["Ann Arbor", "Ann Arbor"], "spelling"
+    assert await _resolve_new_names(["Jean-Luc Picard", "Jean Luc Picard"]) == [
+        "Jean Luc Picard",
+        "Jean Luc Picard",
+    ], "separator"
+    assert await _resolve_new_names(["Aster", "aster 0"]) == ["Aster", "Aster"], "single word, decorated"
+
+
+@pytest.mark.asyncio
+async def test_names_with_different_numbers_stay_separate_in_the_same_batch():
+    """Room 101/Room 102 is 0.64 by trigram, over the 0.5 in-batch bar, so one retain that named
+    both rooms created a single entity."""
+    assert await _resolve_new_names(["Room 101", "Room 102"]) == ["Room 101", "Room 102"]
+    assert await _resolve_new_names(["2023 Tax Return", "2024 Tax Return"]) == [
+        "2023 Tax Return",
+        "2024 Tax Return",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_decimal_number_variants_merge_in_the_same_batch():
+    assert await _resolve_new_names(["GPT-4", "GPT-4.0"]) == ["GPT-4", "GPT-4"]
+
+
+@pytest.mark.asyncio
+async def test_different_decimal_versions_stay_separate_in_the_same_batch():
+    assert await _resolve_new_names(["Python 3.1", "Python 3.10"]) == ["Python 3.1", "Python 3.10"]
+    assert await _resolve_new_names(["v1.1", "v1.10"]) == ["v1.1", "v1.10"]

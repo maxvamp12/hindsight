@@ -7,7 +7,9 @@ Configuration via environment variables - see hindsight_api.config for all env v
 """
 
 import asyncio
+import contextvars
 import logging
+import time
 import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -29,10 +31,16 @@ from ..config import (
     DEFAULT_RERANKER_LITELLM_SDK_MODEL,
     DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
     DEFAULT_RERANKER_LOCAL_MODEL,
+    DEFAULT_RERANKER_LOCAL_TIMEOUT,
     DEFAULT_RERANKER_SILICONFLOW_BASE_URL,
     DEFAULT_RERANKER_SILICONFLOW_MODEL,
     DEFAULT_RERANKER_TEI_BATCH_SIZE,
     DEFAULT_RERANKER_TEI_MAX_CONCURRENT,
+    DEFAULT_RERANKER_TYPESAFE_BASE_URL,
+    DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
+    DEFAULT_RERANKER_TYPESAFE_MODEL,
+    DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
+    DEFAULT_RERANKER_TYPESAFE_TIMEOUT,
     DEFAULT_RERANKER_ZEROENTROPY_MODEL,
     DEFAULT_ZEROENTROPY_BASE_URL,
     RerankerMemberConfig,
@@ -48,8 +56,38 @@ from .local_device import (
 )
 from .remote_retry import RetryPolicy, acall_with_retry
 from .tei_retry import TEI_KEEPALIVE_EXPIRY_SECONDS, is_retryable_tei_transport_error, tei_retry_delay
+from .token_encoding import count_tokens, truncate_to_tokens
 
 logger = logging.getLogger(__name__)
+
+# Which member produced the scores for the predict() running in this task.
+# MultiCrossEncoder._active is shared by every request on the chain, so reading
+# it after await rerank can observe a neighbour's failover. This is set in the
+# same task that is about to return those scores, and rerank() copies it onto
+# the result before yielding.
+_served_provider: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hindsight_rerank_served_provider", default=None
+)
+
+
+class RerankTimeoutError(Exception):
+    """An in-process reranker ran out of wall-clock before scoring every pair.
+
+    Carries the partial result: ``scores[i]`` is the score for ``pairs[i]``, or
+    ``None`` where the budget ran out first. Callers decide what to do with the
+    unscored tail — :class:`~hindsight_api.engine.search.reranking.Reranker`
+    keeps those candidates in their pre-rerank (RRF) order behind the scored ones,
+    so a mis-sized local model degrades the ordering instead of never returning.
+    """
+
+    def __init__(self, scores: list[float | None], timeout: float, model_name: str):
+        self.scores = scores
+        self.timeout = timeout
+        self.model_name = model_name
+        scored = sum(1 for score in scores if score is not None)
+        super().__init__(
+            f"Reranker {model_name!r} exhausted its {timeout:g}s budget after scoring {scored}/{len(scores)} candidates"
+        )
 
 
 class CrossEncoderModel(ABC):
@@ -93,6 +131,13 @@ class CrossEncoderModel(ABC):
     # remember — the omission that let a single Cohere 429 fail an entire recall
     # (#4134).
     retry_policy: RetryPolicy | None = None
+
+    # Whether this backend prunes candidates it judges irrelevant, marking each with
+    # a score of exactly 0.0 for the caller to leave out. Ordinary rerankers only
+    # order candidates — they have no calibrated notion of "not relevant", so their
+    # lowest score still means "least bad of these" and must be kept. Leave False
+    # unless the score is a real decision.
+    prunes_candidates: bool = False
 
     async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
@@ -157,6 +202,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         fp16: bool = False,
         bucket_batching: bool = False,
         batch_size: int = DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
+        timeout: float = DEFAULT_RERANKER_LOCAL_TIMEOUT,
     ):
         """
         Initialize local SentenceTransformers cross-encoder.
@@ -178,6 +224,9 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                             Default: False (opt-in via env var).
             batch_size: Batch size for predict() calls. Optimal values vary by
                        hardware and model (CPU: 32, CUDA: 128+). Default: 32.
+            timeout: Wall-clock ceiling for scoring one call's pairs. On expiry
+                    predict() raises RerankTimeoutError with the partial scores
+                    instead of running to completion. 0 disables. Default: 300.
         """
         self.model_name = model_name or DEFAULT_RERANKER_LOCAL_MODEL
         self.force_cpu = force_cpu
@@ -185,6 +234,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         self.fp16 = fp16
         self.bucket_batching = bucket_batching
         self.batch_size = batch_size
+        self.timeout = timeout
         self._model = None
         self._device_type: str = "cpu"
         LocalSTCrossEncoder._max_concurrent = max_concurrent
@@ -300,31 +350,41 @@ class LocalSTCrossEncoder(CrossEncoderModel):
     def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Synchronous prediction wrapper for thread pool execution.
 
+        Scores in explicit batches rather than one `predict()` call so the wall-clock
+        budget can be enforced between them — a blocking call already inside torch
+        cannot be cancelled from the event loop, and abandoning it with `wait_for`
+        would leave it burning the executor's only worker (#4696).
+
         Supports two optimizations (controlled via .env):
         - bucket_batching: sort pairs by token length to reduce padding waste (36-54% speedup)
         - batch_size: explicit batch size for predict() calls (MPS optimal: 32)
         """
 
         try:
+            order = list(range(len(pairs)))
             if self.bucket_batching and len(pairs) > 1:
                 # Sort pairs by approximate token length to create homogeneous batches.
                 # This eliminates padding waste — short pairs aren't padded to the length
                 # of the longest pair in the batch. Quality-identical by construction.
-                lengths = [len(pairs[i][0]) + len(pairs[i][1]) for i in range(len(pairs))]
-                sorted_indices = sorted(range(len(pairs)), key=lambda i: lengths[i])
-                sorted_pairs = [pairs[i] for i in sorted_indices]
+                order.sort(key=lambda i: len(pairs[i][0]) + len(pairs[i][1]))
 
-                sorted_scores = self._model.predict(sorted_pairs, batch_size=self.batch_size, show_progress_bar=False)
-                sorted_scores = sorted_scores.tolist() if hasattr(sorted_scores, "tolist") else list(sorted_scores)
+            scores: list[float | None] = [None] * len(pairs)
+            # ponytail: the deadline is checked between batches, so one pathological
+            # batch can overshoot it. Bounded by a single batch, which is the point —
+            # cutting mid-batch would mean reaching inside the model's forward pass.
+            deadline = time.monotonic() + self.timeout if self.timeout > 0 else None
 
-                # Restore original order
-                scores = [0.0] * len(pairs)
-                for new_pos, orig_idx in enumerate(sorted_indices):
-                    scores[orig_idx] = sorted_scores[new_pos]
-                return scores
+            for start in range(0, len(order), self.batch_size):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RerankTimeoutError(scores, self.timeout, self.model_name)
+                batch = order[start : start + self.batch_size]
+                batch_pairs = [pairs[i] for i in batch]
+                batch_scores = self._model.predict(batch_pairs, batch_size=self.batch_size, show_progress_bar=False)
+                batch_scores = batch_scores.tolist() if hasattr(batch_scores, "tolist") else list(batch_scores)
+                for i, score in zip(batch, batch_scores):
+                    scores[i] = float(score)
 
-            scores = self._model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
-            return scores.tolist() if hasattr(scores, "tolist") else list(scores)
+            return [0.0 if score is None else score for score in scores]
         finally:
             release_local_inference_memory(self._device_type)
 
@@ -888,6 +948,310 @@ class SiliconFlowCrossEncoder(CrossEncoderModel):
         return await self._client.predict(pairs)
 
 
+# Single source of truth for prompt templates and overheads
+_RANK_INSTRUCTIONS_PREFIX = "Which candidate answers the question: "
+_CUT_INSTRUCTIONS = (
+    "How far down this ranked list does genuine relevance to the question extend? "
+    "Count a candidate as relevant only if it helps answer the question."
+)
+
+_OPTION_KEY_OVERHEAD = 7  # JSON envelope overhead per choice option: '"c249": "' + comma/newline
+_LISTING_ITEM_OVERHEAD = 10  # Formatting overhead per item in cut listing: "[1] ...\n\n"
+_MAX_QUERY_TOKENS = 2_000  # Defensive ceiling on query tokens in reranker
+
+
+class TypeSafeCrossEncoder(CrossEncoderModel):
+    """
+    TypeSafe reranker (https://typesafe.ai), Jev by default.
+
+    Not a Cohere-compatible /rerank endpoint: TypeSafe evaluates typed *questions*
+    against a *state*. This provider asks two of them.
+
+    **Rank — one Choice whose options are the candidates.** A Choice answers with a
+    probability for every option, summing to 1. When the candidate pool fits within
+    MAX_OPTIONS (250) and token context limits, handing it the whole pool returns the
+    ranking in a single call. That beats scoring each candidate on its own: judged together
+    the model only has to say which candidate beats which, instead of pinning every
+    candidate to an absolute scale it must re-derive each time. On a 200-question LoCoMo
+    set the listwise shape scored recall@1 0.94 against 0.87 for one call per candidate,
+    at a thirtieth of the calls. Pools exceeding option limits or token budgets are
+    partitioned into groups whose winners compete in a finals round.
+
+    **Cut — one Score over the ranked shortlist**, asking how far down the list
+    relevance extends. Only asked when ``prune_candidates`` is on. A Score's levels
+    are *ordered*, which is what a cut point needs; the obvious alternative — adding
+    a "none of these" option to the Choice — does not work, because Choice options
+    are unrivalled alternatives rather than a scale, so "none of these" simply wins
+    outright on hard queries and returns nothing at all (35 of 200 questions came
+    back empty in that shape, against 0 here).
+
+    The scores handed back are positions, not confidences: a Choice probability is a
+    share of one pool, so 0.7 means "the best of these" and not "relevant", and two
+    pools are not comparable. Candidates below the cut score exactly 0.0, which is
+    how :attr:`prunes_candidates` tells the caller to leave them out.
+    """
+
+    SYSTEMONE_PATH = "/v1/systemone"
+
+    # A Choice accepts at most 255 options; stay clear of the edge. A pool larger
+    # than this or exceeding single-question token limits is ranked in chunks whose
+    # winners are then ranked against each other, because probabilities are normalised
+    # within a call and so cannot be compared across two of them.
+    MAX_OPTIONS = 250
+
+    # How many of the ranked candidates the cut question is shown. The cut only ever
+    # keeps a handful, so a longer list costs tokens to no purpose.
+    SHORTLIST = 12
+
+    # Context window safety limit for Jev /v1/systemone.
+    # Single question context limit is 32k. A defensive safety margin (26k vs 32k)
+    # absorbs cross-tokenizer divergence and JSON envelope formatting overheads.
+    MAX_QUESTION_TOKENS = 26_000
+
+    # Ordered depths for the cut. The model picks the level; these are the
+    # granularity offered, which is a design choice and not a tuned threshold.
+    #
+    # There is deliberately no "nothing is relevant" level, so at least one candidate
+    # always survives. Recall runs on a pool retrieval already judged plausible, and
+    # one weak memory the caller can dismiss beats silence; adding that level cost
+    # 7% of queries returning nothing and dropped gold retention from 0.81 to 0.65.
+    CUT_LEVELS = [
+        "Only the first candidate is relevant",
+        "The first two are relevant",
+        "The first three are relevant",
+        "The first five are relevant",
+        "The first ten are relevant",
+        "All of the listed candidates are relevant",
+    ]
+    CUT_DEPTHS = [1, 2, 3, 5, 10, None]  # None keeps the whole shortlist
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_RERANKER_TYPESAFE_MODEL,
+        base_url: str = DEFAULT_RERANKER_TYPESAFE_BASE_URL,
+        timeout: float = DEFAULT_RERANKER_TYPESAFE_TIMEOUT,
+        max_concurrent: int = DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
+        prune_candidates: bool = DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
+    ):
+        # Tolerate an unset-but-present value ("VAR=" in a compose file, or a config
+        # built with every field zeroed) by falling back to the default.
+        self.model = model or DEFAULT_RERANKER_TYPESAFE_MODEL
+        self.base_url = (base_url or DEFAULT_RERANKER_TYPESAFE_BASE_URL).rstrip("/")
+        self.timeout = timeout
+        self.prunes_candidates = bool(prune_candidates)
+        # CrossLoopSemaphore, not asyncio.Semaphore: one encoder instance is built at
+        # startup and reached from every loop in the process (worker threads run their
+        # own via asyncio.run), and an asyncio.Semaphore binds to whichever loop first
+        # waits on it — the second loop to contend then raises "bound to a different
+        # event loop". Same reasoning as RemoteTEICrossEncoder's cap above. The calls
+        # it gates are network round trips, well clear of the "short and hot" work
+        # _cross_loop warns against guarding this way.
+        self._semaphore = CrossLoopSemaphore(max_concurrent or DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT)
+        self._session = LoopLocalSession(
+            timeout=per_phase_timeout(timeout),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+
+    @property
+    def provider_name(self) -> str:
+        return "typesafe"
+
+    async def initialize(self) -> None:
+        logger.info(
+            f"Reranker: initializing TypeSafe provider at {self.base_url} with model {self.model} "
+            f"(prune_candidates={self.prunes_candidates})"
+        )
+
+    async def _ask(self, body: dict) -> dict:
+        async with self._semaphore:
+            async with self._session.get().post(
+                f"{self.base_url}{self.SYSTEMONE_PATH}",
+                headers=reranker_bank_attribution_headers(),
+                json=body,
+            ) as response:
+                await raise_for_status(response)
+                return await response.json(content_type=None)
+
+    async def _rank_once(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
+        """Rank one group of candidates, returning their indices best first."""
+        body = {
+            "state": f"Question: {query}",
+            "model": self.model,
+            "questions": {
+                "rank": {
+                    "type": "choice",
+                    "instructions": f"{_RANK_INSTRUCTIONS_PREFIX}{query}",
+                    "criteria": {f"c{position}": docs[index] for position, index in enumerate(indices)},
+                }
+            },
+        }
+        result = await self._ask(body)
+        probabilities = result["answers"]["rank"]["probabilities"]
+        # Sort the option positions, not the indices themselves: the option key encodes
+        # the position, and two candidates can carry the same index-independent text.
+        by_probability = sorted(range(len(indices)), key=lambda position: -float(probabilities[f"c{position}"]))
+        return [indices[position] for position in by_probability]
+
+    async def _rank(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
+        """Rank a whole pool best first, in rounds when it exceeds option or token limits.
+
+        Each round's probabilities are normalised within its own call, so the winners
+        are ranked against each other in a finals round. Candidates that do not make the
+        finals maintain their caller input order (initial RRF rank) behind the finalists,
+        discarding intra-group model ranks since probabilities across separate rounds
+        are not on a shared scale (#4599).
+        """
+        if not indices:
+            return []
+
+        # Available token budget for candidate options in one choice question.
+        state_tokens = count_tokens(f"Question: {query}")
+        # +30: cushion for the question's JSON framing (type, keys) around the instructions.
+        instr_tokens = count_tokens(f"{_RANK_INSTRUCTIONS_PREFIX}{query}") + 30
+        net_budget = max(50, self.MAX_QUESTION_TOKENS - state_tokens - instr_tokens)
+
+        # Pre-truncate outlier documents that individually exceed the question budget,
+        # and copy docs so we don't mutate caller's list.
+        effective_docs = list(docs)
+        doc_tokens: dict[int, int] = {}
+        for index in indices:
+            t = count_tokens(effective_docs[index])
+            if t + _OPTION_KEY_OVERHEAD > net_budget:
+                cap = max(10, net_budget - _OPTION_KEY_OVERHEAD)
+                effective_docs[index] = truncate_to_tokens(effective_docs[index], cap).text
+                t = count_tokens(effective_docs[index])
+            doc_tokens[index] = t
+
+        # Pack candidates into groups bounded by MAX_OPTIONS and net_budget.
+        groups: list[list[int]] = []
+        curr_group: list[int] = []
+        curr_tokens = 0
+        for index in indices:
+            item_tokens = doc_tokens[index] + _OPTION_KEY_OVERHEAD
+            if curr_group and (len(curr_group) >= self.MAX_OPTIONS or curr_tokens + item_tokens > net_budget):
+                groups.append(curr_group)
+                curr_group = [index]
+                curr_tokens = item_tokens
+            else:
+                curr_group.append(index)
+                curr_tokens += item_tokens
+        if curr_group:
+            groups.append(curr_group)
+
+        # Fast path: all candidates fit into a single group.
+        if len(groups) == 1:
+            return await self._rank_once(query, effective_docs, groups[0])
+
+        # Groups with >= 2 candidates are ranked via Jev Choice questions in parallel.
+        # Single-candidate groups skip the preliminary round: a 1-candidate Choice
+        # is rejected by Jev ("criteria must map 2 or more options") and the winner is trivial.
+        multi_indices = [i for i, g in enumerate(groups) if len(g) >= 2]
+        ranked_groups: list[list[int]] = [list(g) for g in groups]
+        if multi_indices:
+            ranked_multi = await asyncio.gather(
+                *(self._rank_once(query, effective_docs, groups[i]) for i in multi_indices)
+            )
+            for i, r in zip(multi_indices, ranked_multi):
+                ranked_groups[i] = r
+
+        # Advance the top of each group to the finals; the rest fall back to RRF order (#4599).
+        # The finals is one Choice, so the finalists must fit MAX_OPTIONS too: long documents
+        # can split a pool into more than MAX_OPTIONS // SHORTLIST groups, so the per-group
+        # quota shrinks, and past MAX_OPTIONS groups the lowest-input-ranked winners overflow
+        # into the rest.
+        quota = max(1, min(self.SHORTLIST, self.MAX_OPTIONS // len(ranked_groups)))
+        finalists = [index for group in ranked_groups for index in group[:quota]]
+        rest = [index for group in ranked_groups for index in group[quota:]] + finalists[self.MAX_OPTIONS :]
+        finalists = finalists[: self.MAX_OPTIONS]
+        index_pos = {idx: pos for pos, idx in enumerate(indices)}
+        rest.sort(key=lambda idx: index_pos[idx])
+
+        # Finals round: if finalists exceed budget, cap each doc evenly (budget // n).
+        finalist_tokens = sum(doc_tokens[idx] + _OPTION_KEY_OVERHEAD for idx in finalists)
+        if finalist_tokens > net_budget:
+            cap = max(10, (net_budget - len(finalists) * _OPTION_KEY_OVERHEAD) // len(finalists))
+            for idx in finalists:
+                if doc_tokens[idx] > cap:
+                    effective_docs[idx] = truncate_to_tokens(effective_docs[idx], cap).text
+
+        ranked_finalists = await self._rank_once(query, effective_docs, finalists)
+        return ranked_finalists + rest
+
+    async def _cut(self, query: str, docs: list[str], order: list[int]) -> int:
+        """How many of the ranked candidates are relevant, as the model sees it."""
+        shortlist = order[: self.SHORTLIST]
+        if not shortlist:
+            return 0
+
+        # Instructions and levels are fixed, plus a cushion for the request's JSON framing.
+        cut_overhead = count_tokens(_CUT_INSTRUCTIONS) + sum(count_tokens(c) for c in self.CUT_LEVELS) + 50
+        prefix = f"Question: {query}\n\nCandidates, already ranked best first:\n"
+        prefix_tokens = count_tokens(prefix)
+        available_listing_tokens = max(100, self.MAX_QUESTION_TOKENS - cut_overhead - prefix_tokens)
+
+        # Truncate shortlist documents if they exceed the available listing budget
+        shortlist_docs = [docs[index] for index in shortlist]
+        shortlist_tokens = [count_tokens(d) for d in shortlist_docs]
+        total_shortlist_tokens = sum(shortlist_tokens) + len(shortlist) * _LISTING_ITEM_OVERHEAD
+        if total_shortlist_tokens > available_listing_tokens:
+            cap = max(10, (available_listing_tokens - len(shortlist) * _LISTING_ITEM_OVERHEAD) // len(shortlist))
+            shortlist_docs = [
+                truncate_to_tokens(d, cap).text if t > cap else d for d, t in zip(shortlist_docs, shortlist_tokens)
+            ]
+
+        listing = "\n\n".join(f"[{position + 1}] {shortlist_docs[position]}" for position in range(len(shortlist)))
+        body = {
+            "state": f"{prefix}{listing}",
+            "model": self.model,
+            "questions": {
+                "depth": {
+                    "type": "score",
+                    "instructions": _CUT_INSTRUCTIONS,
+                    "criteria": self.CUT_LEVELS,
+                }
+            },
+        }
+        result = await self._ask(body)
+        level = round(float(result["answers"]["depth"]["score"]))
+        depth = self.CUT_DEPTHS[min(len(self.CUT_DEPTHS) - 1, max(0, level))]
+        return len(shortlist) if depth is None else min(depth, len(shortlist))
+
+    async def _rank_group(self, query: str, docs: list[str], indices: list[int], scores: list[float]) -> None:
+        if not indices:
+            return
+
+        # Query appears in both State and instructions across rank and cut.
+        # Defensively bound query tokens so that _rank and _cut share the identical
+        # bounded query, preventing context overflow in _cut and eliminating semantic drift.
+        max_allowed_query = max(50, (self.MAX_QUESTION_TOKENS - 200) // 2)
+        effective_query_cap = min(_MAX_QUERY_TOKENS, max_allowed_query)
+        if count_tokens(query) > effective_query_cap:
+            query = truncate_to_tokens(query, effective_query_cap).text
+
+        order = await self._rank(query, docs, indices)
+        keep = await self._cut(query, docs, order) if self.prunes_candidates else len(order)
+        # Positions, not confidences — see the class docstring. Descending from 1.0 so
+        # the caller's ordering is preserved, and 0.0 for everything past the cut,
+        # which is how prunes_candidates marks a candidate to leave out.
+        for position, index in enumerate(order):
+            scores[index] = (len(order) - position) / len(order) if position < keep else 0.0
+
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+        docs = [doc for _, doc in pairs]
+        query_groups: dict[str, list[int]] = {}
+        for index, (query, _) in enumerate(pairs):
+            query_groups.setdefault(query, []).append(index)
+
+        scores = [0.0] * len(pairs)
+        await asyncio.gather(
+            *(self._rank_group(query, docs, indices, scores) for query, indices in query_groups.items())
+        )
+        return scores
+
+
 class RRFPassthroughCrossEncoder(CrossEncoderModel):
     """
     Passthrough cross-encoder that preserves RRF scores without neural reranking.
@@ -1407,8 +1771,8 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
         _ = transformers.AutoTokenizer
 
         try:
-            import mlx.core  # noqa: F401
-            import mlx_lm  # noqa: F401
+            import mlx.core  # noqa: F401  # ty: ignore[unresolved-import]
+            import mlx_lm  # noqa: F401  # ty: ignore[unresolved-import]
         except ImportError as exc:
             # Only swallow "package not installed" errors. Anything else (e.g. a
             # transitive import failure inside mlx_lm) must surface verbatim so
@@ -1417,9 +1781,16 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
             msg = str(exc)
             if "mlx" not in msg and "mlx_lm" not in msg:
                 raise
+            # mlx is Apple's Metal/unified-memory framework, so the local-ml extra
+            # only installs it on macOS arm64 (see pyproject.toml). Missing here
+            # therefore usually means "wrong platform", not "forgot the extra" —
+            # say both, and name the way out.
             raise ImportError(
-                "mlx and mlx-lm are required for JinaMLXCrossEncoder. "
-                "Install with: pip install mlx>=0.31.0 mlx-lm>=0.31.1 safetensors>=0.6.2"
+                "mlx and mlx-lm are required for the 'jina-mlx' reranker, and are only "
+                "installed on Apple Silicon — mlx is Apple's Metal framework, and its "
+                "Linux build is CPU-only and slower than the 'local' provider. Set "
+                "HINDSIGHT_API_RERANKER_PROVIDER=local (or a hosted provider), or install "
+                "them yourself: pip install mlx>=0.31.0 mlx-lm>=0.31.1 safetensors>=0.6.2"
             ) from exc
 
         loop = asyncio.get_event_loop()
@@ -1716,11 +2087,9 @@ class MultiCrossEncoder(CrossEncoderModel):
     def provider_name(self) -> str:
         """The provider of the member that last served a request (primary before any).
 
-        Callers use this to detect a passthrough reranker, so it has to track the
-        member actually serving rather than name the chain: a chain that has
-        degraded to its ``rrf`` member is passthrough. Concurrent requests share it,
-        so a request that fails over can briefly mislabel a neighbour — this only
-        tunes downstream scoring, never correctness.
+        This shared cursor is for diagnostics only: concurrent requests can move
+        it after another request received its scores. Recall uses the provider
+        captured on RerankResult to decide passthrough scoring and response metadata.
         """
         return self._members[self._active].provider_name
 
@@ -1788,6 +2157,9 @@ class MultiCrossEncoder(CrossEncoderModel):
                     member.provider_name,
                 )
             self._active = index
+            # Record the member for this task before returning. A later read of
+            # provider_name follows _active and can name a different request.
+            _served_provider.set(member.provider_name)
             return scores
         # All members failed; surface the last error (loop ran at least once).
         assert last_exc is not None
@@ -1869,6 +2241,7 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             fp16=member.local_fp16,
             bucket_batching=member.local_bucket_batching,
             batch_size=member.local_batch_size,
+            timeout=member.local_timeout,
         )
     elif provider == "cohere":
         api_key = member.cohere_api_key
@@ -1970,13 +2343,27 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             model=member.alibaba_model,
             timeout=member.alibaba_timeout,
         )
+    elif provider == "typesafe":
+        api_key = member.typesafe_api_key
+        if not api_key:
+            raise ValueError(
+                f"{member.env_name('TYPESAFE_API_KEY')} is required when {member.env_name('PROVIDER')} is 'typesafe'"
+            )
+        return TypeSafeCrossEncoder(
+            api_key=api_key,
+            model=member.typesafe_model,
+            base_url=member.typesafe_base_url,
+            timeout=member.typesafe_timeout,
+            max_concurrent=member.typesafe_max_concurrent,
+            prune_candidates=member.typesafe_prune_candidates,
+        )
     elif provider == "rrf":
         return RRFPassthroughCrossEncoder()
     elif provider == "jina-mlx":
         return JinaMLXCrossEncoder()
     else:
         raise ValueError(
-            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'alibaba', 'google', 'flashrank', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
+            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'typesafe', 'alibaba', 'google', 'flashrank', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
         )
 
 

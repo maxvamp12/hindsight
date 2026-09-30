@@ -100,6 +100,13 @@ version, move the liveness path over.
 
 ## Available Metrics
 
+:::note High-cardinality labels are opt-in
+`bank_id` and `tenant` (the tenant schema) are left off every metric by default, because each
+one adds a series set per bank or tenant. Turn them on with
+`HINDSIGHT_API_METRICS_INCLUDE_BANK_ID=true` / `HINDSIGHT_API_METRICS_INCLUDE_TENANT=true`
+only on deployments with few banks or tenants. The backlog gauges always carry `tenant`.
+:::
+
 ### Operation Metrics
 
 | Metric | Type | Labels | Description |
@@ -324,7 +331,7 @@ Hindsight supports OpenTelemetry distributed tracing for memory operations and L
 
 ### Configuration
 
-See [Configuration - OpenTelemetry Tracing](./configuration#opentelemetry-tracing) for environment variables.
+See [Configuration - OpenTelemetry Tracing](./configuration.md#opentelemetry-tracing) for environment variables.
 
 **Quick Start:**
 ```bash

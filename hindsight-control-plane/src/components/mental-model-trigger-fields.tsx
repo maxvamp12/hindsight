@@ -38,6 +38,9 @@ export type TriggerForm = {
   includeChunks: "" | "true" | "false";
   recallMaxTokens: string;
   recallChunksMaxTokens: string;
+  observationsMaxTokens: string;
+  observationsIncludeEntities: "" | "true" | "false";
+  budget: "" | "low" | "mid" | "high";
   responseSchema: string;
   keepTrace: boolean;
 };
@@ -65,6 +68,17 @@ export function triggerFormFromTrigger(trigger?: Partial<MentalModelTrigger> | n
     recallMaxTokens: trigger?.recall_max_tokens != null ? String(trigger.recall_max_tokens) : "",
     recallChunksMaxTokens:
       trigger?.recall_chunks_max_tokens != null ? String(trigger.recall_chunks_max_tokens) : "",
+    observationsMaxTokens:
+      trigger?.reflect_search_observations_max_tokens != null
+        ? String(trigger.reflect_search_observations_max_tokens)
+        : "",
+    observationsIncludeEntities:
+      trigger?.reflect_search_observations_include_entities === true
+        ? "true"
+        : trigger?.reflect_search_observations_include_entities === false
+          ? "false"
+          : "",
+    budget: trigger?.budget || "",
     responseSchema: trigger?.response_schema
       ? JSON.stringify(trigger.response_schema, null, 2)
       : "",
@@ -109,6 +123,14 @@ export function triggerFromForm(form: TriggerForm): MentalModelTrigger | null {
       form.includeChunks === "true" ? true : form.includeChunks === "false" ? false : undefined,
     recall_max_tokens: toInt(form.recallMaxTokens),
     recall_chunks_max_tokens: toInt(form.recallChunksMaxTokens),
+    reflect_search_observations_max_tokens: toInt(form.observationsMaxTokens),
+    reflect_search_observations_include_entities:
+      form.observationsIncludeEntities === "true"
+        ? true
+        : form.observationsIncludeEntities === "false"
+          ? false
+          : undefined,
+    budget: form.budget || undefined,
     // response_schema is only ever set through the schema builder, which
     // guarantees valid, usable JSON.
     response_schema: form.responseSchema.trim()
@@ -127,6 +149,9 @@ function hasAdvancedValues(form: TriggerForm): boolean {
     form.includeChunks ||
     form.recallMaxTokens.trim() ||
     form.recallChunksMaxTokens.trim() ||
+    form.observationsMaxTokens.trim() ||
+    form.observationsIncludeEntities ||
+    form.budget ||
     form.responseSchema.trim() ||
     form.keepTrace
   );
@@ -321,6 +346,13 @@ export function MentalModelTriggerFields({
             value={form.factTypes}
             onChange={(v) => setForm({ ...form, factTypes: v as FactType[] })}
           />
+          {/* An empty selection is not "no types" — it means no filter, i.e. all
+              types (it saves as fact_types: null). The "?" Hint says so, but empty
+              checkboxes read as "none"; surface the effective value inline, matching
+              the read-only summary/detail view, so the editor can't be misread. */}
+          {form.factTypes.length === 0 && (
+            <p className="text-xs text-muted-foreground italic">{t("triggerFactTypesAll")}</p>
+          )}
         </div>
         <Row
           label={t("optionsExcludeAllLabel")}
@@ -425,6 +457,65 @@ export function MentalModelTriggerFields({
                 placeholder={t("optionsRecallChunksMaxTokensPlaceholder")}
                 className="h-8"
               />
+            </Row>
+            <Row
+              label={t("optionsObservationsMaxTokensLabel")}
+              description={t("optionsObservationsMaxTokensDescription")}
+              htmlFor={`${id}-observations-max`}
+            >
+              <Input
+                id={`${id}-observations-max`}
+                type="number"
+                min="1"
+                value={form.observationsMaxTokens}
+                onChange={(e) => setForm({ ...form, observationsMaxTokens: e.target.value })}
+                placeholder={t("optionsRecallMaxTokensPlaceholder")}
+                className="h-8"
+              />
+            </Row>
+            <Row
+              label={t("optionsObservationsEntitiesLabel")}
+              description={t("optionsObservationsEntitiesDescription")}
+            >
+              <Select
+                value={form.observationsIncludeEntities || "default"}
+                onValueChange={(v) =>
+                  setForm({
+                    ...form,
+                    observationsIncludeEntities: v === "default" ? "" : (v as "true" | "false"),
+                  })
+                }
+              >
+                <SelectTrigger className="h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">{t("optionsIncludeChunksDefault")}</SelectItem>
+                  <SelectItem value="true">{t("optionsObservationsEntitiesYes")}</SelectItem>
+                  <SelectItem value="false">{t("optionsObservationsEntitiesNo")}</SelectItem>
+                </SelectContent>
+              </Select>
+            </Row>
+            <Row label={t("optionsBudgetLabel")} description={t("optionsBudgetDescription")}>
+              <Select
+                value={form.budget || "default"}
+                onValueChange={(v) =>
+                  setForm({
+                    ...form,
+                    budget: v === "default" ? "" : (v as "low" | "mid" | "high"),
+                  })
+                }
+              >
+                <SelectTrigger className="h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">{t("optionsBudgetDefault")}</SelectItem>
+                  <SelectItem value="low">low</SelectItem>
+                  <SelectItem value="mid">mid</SelectItem>
+                  <SelectItem value="high">high</SelectItem>
+                </SelectContent>
+              </Select>
             </Row>
             <div className="space-y-2">
               <div className="flex items-center gap-1.5">

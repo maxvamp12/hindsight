@@ -71,7 +71,9 @@ _ON_CONFLICT_DO_UPDATE_RE = re.compile(
     r"\bON\s+CONFLICT\s*\((?:[^()]*|\([^()]*\))*\)\s*DO\s+UPDATE\s+SET\b", re.IGNORECASE
 )
 
-_RETURNING_RE = re.compile(r"\bRETURNING\s+(.+)", re.IGNORECASE | re.DOTALL)
+# A PG RETURNING clause. "RETURNING <type>" (e.g. JSON_MERGEPATCH(..., :1 RETURNING CLOB))
+# is an Oracle JSON-function returning clause, not a statement-level RETURNING.
+_RETURNING_RE = re.compile(r"\bRETURNING\s+(?!(?:CLOB|BLOB|VARCHAR2|JSON)\b)(.+)", re.IGNORECASE | re.DOTALL)
 
 _ANY_RE = re.compile(r"=\s*ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 _NOT_ALL_RE = re.compile(r"!=\s*ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
@@ -126,6 +128,17 @@ def _convert_arg(value: Any) -> Any:
 def _convert_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
     """Convert a tuple of Python values to Oracle-compatible bind values."""
     return tuple(_convert_arg(a) for a in args)
+
+
+def _needs_clob_bind(val: Any) -> bool:
+    """JSON text, or any string past VARCHAR2's 4000 bytes: bind as CLOB.
+
+    The thin driver otherwise binds a long string as LONG, which Oracle refuses for
+    anything but a LONG column (ORA-01461) -- notably a VECTOR embedding literal.
+    """
+    if not isinstance(val, str) or not val:
+        return False
+    return val[0] in ("{", "[") or (len(val) > 1000 and len(val.encode()) > 4000)
 
 
 def _convert_args_list(args_list: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
@@ -319,13 +332,18 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # $N → :N
     query = _PG_PARAM_RE.sub(r":\1", query)
 
-    # JSONB merge operator: col || :N::jsonb → JSON_MERGEPATCH(col, :N)
+    # JSONB merge operator: col || :N::jsonb → JSON_MERGEPATCH(col, :N RETURNING CLOB)
     # Must happen BEFORE cast strip so we can detect ::jsonb
-    query = re.sub(r"(\w+)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2)", query, flags=re.IGNORECASE)
+    # RETURNING CLOB is required: without it JSON_MERGEPATCH returns VARCHAR2(4000)
+    # with NULL ON ERROR, so a merged document over 4000 bytes silently becomes NULL
+    # (e.g. ORA-01407 when updating the NOT NULL banks.config column).
+    query = re.sub(
+        r"(\w+)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query, flags=re.IGNORECASE
+    )
 
     # JSONB merge with complex left-hand expression (e.g. COALESCE(...)):
     #   COALESCE(col, '[]'::jsonb) || :N::jsonb
-    #   → JSON_MERGEPATCH(COALESCE(col, TO_CLOB('[]')), :N)
+    #   → JSON_MERGEPATCH(COALESCE(col, TO_CLOB('[]')), :N RETURNING CLOB)
     # The simple \w+ regex above won't match a closing paren.  We also
     # wrap any JSON string literals inside the COALESCE with TO_CLOB to
     # prevent ORA-00932 (CHAR vs CLOB type mismatch with CLOB columns).
@@ -334,7 +352,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         bind_param = m.group(2)
         # Wrap any 'literal'::jsonb inside COALESCE with TO_CLOB
         coalesce_expr = re.sub(r"'([^']*)'::(jsonb|json)", r"TO_CLOB('\1')", coalesce_expr, flags=re.IGNORECASE)
-        return f"JSON_MERGEPATCH({coalesce_expr}, {bind_param})"
+        return f"JSON_MERGEPATCH({coalesce_expr}, {bind_param} RETURNING CLOB)"
 
     query = re.sub(
         r"(COALESCE\([^)]+\))\s*\|\|\s*(:\w+)::jsonb",
@@ -357,6 +375,27 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     query = re.sub(
         r"""\((\w+)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
         _rewrite_json_bool,
+        query,
+        flags=re.IGNORECASE,
+    )
+
+    # NOT (col::jsonb @> '{"is_parent": true}'::jsonb) — used by list_operations
+    # (exclude_parents). _JSONB_CONTAINS_RE only handles bind params, so the literal
+    # form would reach Oracle verbatim. Must run BEFORE the cast strip. Keeps PG's
+    # three-valued logic: a NULL column makes NOT (NULL @> ...) NULL, i.e. excluded.
+    def _rewrite_not_jsonb_is_parent(m: re.Match) -> str:
+        col = m.group(1)
+        return (
+            f"({col} IS NOT NULL AND ("
+            f"CASE WHEN JSON_VALUE({col}, '$.type()') = 'object' "
+            f"AND JSON_VALUE({col}, '$.is_parent.type()') = 'boolean' "
+            f"AND JSON_VALUE({col}, '$.is_parent') = 'true' "
+            f"THEN 1 ELSE 0 END = 0))"
+        )
+
+    query = re.sub(
+        r"""NOT\s*\(\s*(\w+)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
+        _rewrite_not_jsonb_is_parent,
         query,
         flags=re.IGNORECASE,
     )
@@ -623,6 +662,50 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 # ---------------------------------------------------------------------------
 
 
+def _oracle_connect_params(dsn: str) -> dict[str, Any]:
+    """Turn the configured database URL into oracledb connect kwargs.
+
+    Accepts ``oracle://user:pass@host:port/service`` and, for Autonomous
+    Database / TCPS setups that need a full connect descriptor or TNS alias,
+    ``oracle://user:pass@/?dsn=<descriptor-or-alias>``. Credentials are
+    URL-decoded, so passwords containing ``#``, ``@`` or ``%`` work when
+    percent-encoded in the URL. Anything that is not an ``oracle://`` URL is
+    passed through as the dsn.
+    """
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    parsed = urlparse(dsn)
+    if parsed.scheme not in ("oracle", "oracle+oracledb"):
+        return {"dsn": dsn}
+    params: dict[str, Any] = {
+        "user": unquote(parsed.username) if parsed.username else None,
+        "password": unquote(parsed.password) if parsed.password else None,
+    }
+    descriptor = parse_qs(parsed.query).get("dsn")
+    if descriptor and descriptor[0]:
+        params["dsn"] = descriptor[0]
+    else:
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 1521
+        service = parsed.path.lstrip("/") if parsed.path else "FREEPDB1"
+        params["dsn"] = f"{host}:{port}/{service}"
+    return params
+
+
+async def _disable_parallel_dml(conn: Any, _requested_tag: str | None) -> None:
+    """Run once per new pooled session.
+
+    Autonomous Database's medium/high services enable parallel DML by default, and a
+    transaction that reads a table after a parallel DML on it fails with ORA-12838 --
+    retain does exactly that. Plain Oracle has it off already, so this is a no-op there.
+    """
+    cursor = conn.cursor()
+    try:
+        await cursor.execute("ALTER SESSION DISABLE PARALLEL DML")
+    finally:
+        cursor.close()
+
+
 def _import_oracledb():
     """Lazy import oracledb to avoid hard dependency."""
     try:
@@ -733,7 +816,7 @@ class OracleConnection(DatabaseConnection):
         oracledb = _import_oracledb()
         sizes: dict[str, Any] = {}
         for key, val in params.items():
-            if isinstance(val, str) and val and val[0] in ("{", "[") and f":{key}" in query:
+            if _needs_clob_bind(val) and f":{key}" in query:
                 sizes[key] = oracledb.DB_TYPE_CLOB
             # None params in COALESCE/GREATEST/LEAST with timestamp columns need
             # explicit timestamp type to avoid ORA-00932 (VARCHAR2 NULL vs
@@ -964,6 +1047,11 @@ class OracleConnection(DatabaseConnection):
     # -- DML methods ------------------------------------------------------
 
     async def execute(self, query: str, *args: Any, timeout: float | None = None) -> str:
+        # PostgreSQL planner/session GUCs (SET LOCAL enable_seqscan, lock_timeout,
+        # hnsw.ef_search, ...) have no Oracle equivalent; running them raises
+        # ORA-00922. They are tuning hints scoped to the transaction, so skip them.
+        if query.lstrip().upper().startswith("SET LOCAL "):
+            return "SET"
         orig_query = query
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(query)
         cursor = self._conn.cursor()
@@ -1009,6 +1097,7 @@ class OracleConnection(DatabaseConnection):
                 # Row-by-row with individual dup suppression
                 for row in converted:
                     params = {str(i + 1): v for i, v in enumerate(row)}
+                    self._apply_clob_input_sizes(cursor, query, params)
                     try:
                         await cursor.execute(query, params)
                     except Exception as e:
@@ -1017,6 +1106,11 @@ class OracleConnection(DatabaseConnection):
             else:
                 # Convert tuples to dicts for named binding (:1, :2, ...)
                 converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
+                # The driver types each column from the first row, so a column holding
+                # any CLOB-sized value must be declared CLOB for the whole batch.
+                clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
+                if clob_keys:
+                    cursor.setinputsizes(**dict.fromkeys(clob_keys, _import_oracledb().DB_TYPE_CLOB))
                 try:
                     await cursor.executemany(query, converted_dicts)
                 except Exception as e:
@@ -1267,22 +1361,10 @@ class OracleBackend(DatabaseBackend):
 
         self._acquire_warn_threshold_s = get_config().db_acquire_warn_threshold_ms / 1000.0
 
-        # Parse URL-format DSN (oracle://user:pass@host:port/service)
-        from urllib.parse import urlparse
-
-        parsed = urlparse(dsn)
         pool_kwargs: dict[str, Any] = {"min": min_size, "max": max_size, "stmtcachesize": statement_cache_size}
-        if parsed.scheme in ("oracle", "oracle+oracledb"):
-            pool_kwargs["user"] = parsed.username
-            pool_kwargs["password"] = parsed.password
-            host = parsed.hostname or "localhost"
-            port = parsed.port or 1521
-            service = parsed.path.lstrip("/") if parsed.path else "FREEPDB1"
-            pool_kwargs["dsn"] = f"{host}:{port}/{service}"
-        else:
-            pool_kwargs["dsn"] = dsn
+        pool_kwargs.update(_oracle_connect_params(dsn))
 
-        self._pool = oracledb.create_pool_async(**pool_kwargs)
+        self._pool = oracledb.create_pool_async(**pool_kwargs, session_callback=_disable_parallel_dml)
 
         logger.info(f"Oracle pool created (min={min_size}, max={max_size})")
 

@@ -27,7 +27,7 @@ pip install hindsight-all
 
 The `hindsight-all` wheel bundles `hindsight-api-slim`, `hindsight-client`, and `hindsight-embed` as dependencies, so one `pip install` gets you everything.
 
-On Intel (x86_64) Macs, install `hindsight-all-slim` instead — the full bundle's local ML models have no Intel-Mac wheels. See [Supported Platforms](../developer/installation#supported-platforms).
+On Intel (x86_64) Macs, install `hindsight-all-slim` instead — the full bundle's local ML models have no Intel-Mac wheels. See [Supported Platforms](../developer/installation.md#supported-platforms).
 
 ## `HindsightServer` — explicit lifecycle
 

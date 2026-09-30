@@ -14,6 +14,9 @@ Every team that uses long-term memory eventually runs into the same problem: the
 
 <!-- truncate -->
 
+import {Flow} from '@vectorize-io/interfig';
+import templates from '@vectorize-io/interfig/figures/templates';
+
 ## TL;DR
 
 - Hindsight 0.5.0 adds a *Bank Templates Hub* for reusable memory bank setup.
@@ -52,13 +55,7 @@ That means the memory behavior for an agent can now be treated like configuratio
 
 At a high level, the workflow looks like this:
 
-```mermaid
-flowchart LR
-  A[Create or tune a bank] --> B[Export template manifest]
-  B --> C[Review or share JSON]
-  C --> D[Import into another bank]
-  D --> E[Same memory behavior, new bank]
-```
+<Flow {...templates.props} />
 
 The new Templates Hub adds a discoverable front end to that workflow. Instead of starting from an empty bank, you can begin with a known-good template and adjust from there.
 
@@ -302,7 +299,7 @@ For teams building agents seriously, that is the difference between "we have one
 
 ## Next steps
 
-- **Use Hindsight Cloud:** Skip self-hosting with a [free account](https://ui.hindsight.vectorize.io/signup)
+- **Use Hindsight Cloud:** Skip self-hosting with a [free account](https://ui.hindsight.vectorize.io)
 - **Browse the starter gallery:** [hindsight.vectorize.io/templates](https://hindsight.vectorize.io/templates)
 - **Read the API docs:** [Bank templates reference](/developer/api/bank-templates)
 - **See what else is in 0.5.0:** [What's new in Hindsight 0.5.0](/blog/2026/04/07/version-0-5-0)

@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Final, cast
 
 from .db_utils import acquire_with_retry
@@ -124,9 +125,38 @@ def trigram_similarity(a: str, b: str) -> float:
 _MIN_TOKEN_SIMILARITY: Final[float] = 0.6
 
 
+@lru_cache(maxsize=100_000)
 def _tokens_match(a: str, b: str) -> bool:
-    """Whether two words are plausibly the same word — equal, an abbreviation of, or a near-miss."""
+    """Whether two words are plausibly the same word — equal, an abbreviation of, or a near-miss.
+
+    Memoized because the in-batch caller is quadratic in names and its pairs overwhelmingly repeat
+    the same words: 250 names of the shape "Acme Corporation Subsidiary 0001" produce 31k similar
+    pairs whose word comparisons are 90% duplicates, and caching them takes that filtering pass from
+    ~1.0s to ~0.27s of un-yielded CPU. Pure function of two short strings, so the cache is only a
+    speed-up; the bound is there to keep a pathological bank from growing it without limit.
+    """
     return a == b or a.startswith(b) or b.startswith(a) or SequenceMatcher(None, a, b).ratio() >= _MIN_TOKEN_SIMILARITY
+
+
+_DIGIT_RUN = re.compile(r"\d+(?:\.\d+)*")
+
+
+@lru_cache(maxsize=100_000)
+def _numbers_in(name: str) -> frozenset[str]:
+    """Find the numbers in a name ("UA0123" gives {"123"}, "4.0" gives {"4"}).
+
+    Memoized for the same reason as ``_tokens_match``: the in-batch caller compares each name
+    with many others.
+    """
+    numbers = []
+    for run in _DIGIT_RUN.findall(name):
+        parts = run.split(".")
+        parts[0] = parts[0].lstrip("0") or "0"
+        # Drop an all-zero part, but keep 3.10 distinct from 3.1.
+        if len(parts) == 2 and not parts[1].strip("0"):
+            parts.pop()
+        numbers.append(".".join(parts))
+    return frozenset(numbers)
 
 
 def _tokens_are_compatible(a: str, b: str) -> bool:
@@ -141,7 +171,18 @@ def _tokens_are_compatible(a: str, b: str) -> bool:
     Single-word names are exempt, and deliberately: with one token the whole-name check *is* the
     token check, and imposing this on top would reject real variants that have no long shared word
     to hide behind ("Nick"/"Nicolas" is 0.55).
+
+    Numbers get a stricter rule. A number names one specific thing, so "Room 101" and "Room 102"
+    are two rooms and not a typo, yet 101/102 is 0.67 by sequence ratio and passes the word cutoff.
+    When each name has a number the other lacks, they are two things, and single-word names are not
+    exempt from this ("UA123"/"UA124"). A first version required the numbers to match exactly, which
+    also split a name from its more specific form ("Q3 earnings"/"Q3 2024 earnings", "Boeing 737
+    MAX"/"Boeing 737 MAX 8"); when one name's numbers are a subset of the other's, the word check
+    decides as before, as it does when only one name has a number ("Python"/"Python 3").
     """
+    numbers_a, numbers_b = _numbers_in(a), _numbers_in(b)
+    if numbers_a - numbers_b and numbers_b - numbers_a:
+        return False
     ta, tb = _TRGM_WORD.findall(a.lower()), _TRGM_WORD.findall(b.lower())
     if len(ta) < 2 and len(tb) < 2:
         return True
@@ -1086,6 +1127,22 @@ class EntityResolver:
         pg_trgm), so it is backend-agnostic — no DB round-trip on the retain hot path, and it runs
         identically on PostgreSQL, Oracle, and the pg_trgm-absent "full" fallback. Label entities
         are excluded so distinct label values stay separate (GH-1558).
+
+        A similar pair must also agree word by word (``_tokens_are_compatible``), the same second
+        gate the existing-entity path applies after its own trigram floor. Trigram similarity alone
+        lets a long shared word drown out a completely different short one, and "Dr John
+        Richardson" / "Dr Jane Richardson" is 0.65, comfortably over the 0.5 in-batch bar. Without
+        the word check two people who share a surname become one entity when they are named in the
+        same retain and stay two when they are not.
+
+        The word check runs on the pairs the trigram join returned, not inside it, so
+        ``_find_intrabatch_similar_pairs`` keeps its pure-Jaccard contract. That costs a second pass
+        over those pairs, which matters only where this pass is already at its worst: 250 names that
+        are all alike produce ~31k pairs, and checking them adds ~0.27s to the ~34ms join — ~1.0s
+        before ``_tokens_match`` was memoized. One more reason not to raise
+        ``_INTRABATCH_MAX_NAMES`` on the distinct-name numbers alone. If that tail ever needs to
+        come down, run the check inside the union-find instead, only for pairs whose roots differ —
+        same clusters, ~12x fewer checks on that shape.
         """
         rep_by_lower: dict[str, str] = {}
         count_by_lower: dict[str, int] = {}
@@ -1106,7 +1163,11 @@ class EntityResolver:
                 _INTRABATCH_MAX_NAMES,
             )
             return {}
-        pairs = _find_intrabatch_similar_pairs(list(rep_by_lower.values()), self._intrabatch_merge_similarity)
+        pairs = [
+            pair
+            for pair in _find_intrabatch_similar_pairs(list(rep_by_lower.values()), self._intrabatch_merge_similarity)
+            if _tokens_are_compatible(pair.name_a, pair.name_b)
+        ]
         if not pairs:
             return {}
         return _cluster_new_entity_names(rep_by_lower, count_by_lower, pairs)

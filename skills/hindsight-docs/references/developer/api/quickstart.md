@@ -117,7 +117,36 @@ go get github.com/vectorize-io/hindsight/hindsight-clients/go
 ```
 
 ```go
-# Section 'quickstart-full' not found in api/quickstart.go
+cfg := hindsight.NewConfiguration()
+cfg.Servers = hindsight.ServerConfigurations{
+	{URL: "http://localhost:8888"},
+}
+client := hindsight.NewAPIClient(cfg)
+ctx := context.Background()
+
+// Retain a memory
+retainReq := hindsight.RetainRequest{
+	Items: []hindsight.MemoryItem{
+		{Content: hindsight.TextContent("Alice works at Google")},
+	},
+}
+client.MemoryAPI.RetainMemories(ctx, "my-bank").RetainRequest(retainReq).Execute()
+
+// Recall memories
+recallReq := hindsight.RecallRequest{
+	Query: "What does Alice do?",
+}
+resp, _, _ := client.MemoryAPI.RecallMemories(ctx, "my-bank").RecallRequest(recallReq).Execute()
+for _, r := range resp.Results {
+	fmt.Println(r.Text)
+}
+
+// Reflect - generate response
+reflectReq := hindsight.ReflectRequest{
+	Query: "Tell me about Alice",
+}
+answer, _, _ := client.MemoryAPI.Reflect(ctx, "my-bank").ReflectRequest(reflectReq).Execute()
+fmt.Println(answer.GetText())
 ```
 
 ---
@@ -138,8 +167,8 @@ Browse all supported integrations in the Integrations Hub.
 
 ## Next Steps
 
-- [**Retain**](./retain) — Advanced options for storing memories
-- [**Recall**](./recall) — Search and retrieval strategies
-- [**Reflect**](./reflect) — Disposition-aware reasoning
-- [**Memory Banks**](./memory-banks) — Configure disposition and mission
+- [**Retain**](./retain.md) — Advanced options for storing memories
+- [**Recall**](./recall.md) — Search and retrieval strategies
+- [**Reflect**](./reflect.md) — Disposition-aware reasoning
+- [**Memory Banks**](./memory-banks.md) — Configure disposition and mission
 - [**Server Deployment**](../installation.md) — Docker Compose, Helm, and production setup

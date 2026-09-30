@@ -9,14 +9,16 @@ import asyncio
 import json
 import random
 import warnings
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
-from collections.abc import Awaitable, Callable
 from typing import Any, Literal
+
+import aiohttp
+from yarl import URL
 
 import hindsight_client_api
 from hindsight_client_api.exceptions import ApiException
@@ -717,6 +719,8 @@ class Hindsight:
         fact_types: list[str] | None = None,
         exclude_mental_models: bool = False,
         exclude_mental_model_ids: list[str] | None = None,
+        reflect_search_observations_max_tokens: int | None = None,
+        reflect_search_observations_include_entities: bool | None = None,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories (sync wrapper — prefer :meth:`areflect` in async code).
@@ -749,6 +753,11 @@ class Hindsight:
             fact_types: Optional list of fact types to include (world, experience, observation).
             exclude_mental_models: If True, exclude all mental models from reflection (default: False).
             exclude_mental_model_ids: Optional list of specific mental model IDs to exclude.
+            reflect_search_observations_max_tokens: Token budget for the agent's search_observations
+                calls. None uses the bank's reflect_default_options, then the shipped default.
+            reflect_search_observations_include_entities: Whether search_observations attaches
+                resolved entity names, which can be over half the tool payload. None uses the
+                bank default (enabled).
 
         Returns:
             ReflectResponse with answer text, optionally facts used, optionally a 'trace' with
@@ -773,6 +782,8 @@ class Hindsight:
                 fact_types=fact_types,
                 exclude_mental_models=exclude_mental_models,
                 exclude_mental_model_ids=exclude_mental_model_ids,
+                reflect_search_observations_max_tokens=reflect_search_observations_max_tokens,
+                reflect_search_observations_include_entities=reflect_search_observations_include_entities,
             )
         )
 
@@ -950,8 +961,6 @@ class Hindsight:
         enable_reranking: bool | None = None,
         background: str | None = None,
     ) -> BankProfileResponse:
-        import aiohttp
-
         body: dict[str, Any] = {}
         if name is not None:
             body["name"] = name
@@ -1402,6 +1411,8 @@ class Hindsight:
         fact_types: list[str] | None = None,
         exclude_mental_models: bool = False,
         exclude_mental_model_ids: list[str] | None = None,
+        reflect_search_observations_max_tokens: int | None = None,
+        reflect_search_observations_include_entities: bool | None = None,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories (async — preferred over :meth:`reflect`).
@@ -1434,6 +1445,11 @@ class Hindsight:
             fact_types: Optional list of fact types to include (world, experience, observation).
             exclude_mental_models: If True, exclude all mental models from reflection (default: False).
             exclude_mental_model_ids: Optional list of specific mental model IDs to exclude.
+            reflect_search_observations_max_tokens: Token budget for the agent's search_observations
+                calls. None uses the bank's reflect_default_options, then the shipped default.
+            reflect_search_observations_include_entities: Whether search_observations attaches
+                resolved entity names, which can be over half the tool payload. None uses the
+                bank default (enabled).
 
         Returns:
             ReflectResponse with answer text, optionally facts used, optionally a 'trace' with
@@ -1472,6 +1488,8 @@ class Hindsight:
             fact_types=fact_types,
             exclude_mental_models=exclude_mental_models or None,
             exclude_mental_model_ids=exclude_mental_model_ids,
+            reflect_search_observations_max_tokens=reflect_search_observations_max_tokens,
+            reflect_search_observations_include_entities=reflect_search_observations_include_entities,
         )
 
         return await _retry_on_capacity(
@@ -2456,11 +2474,22 @@ class Hindsight:
         download_url = meta.get("download_url")
         if not download_url:
             raise RuntimeError(f"Export operation {operation_id} completed without a download_url")
+        if download_url.lower().startswith(("https://", "http://")):
+            # Object stores return signed URLs. Preserve their query string and
+            # keep Hindsight's configured auth headers off the storage request.
+            # trust_env matches the generated client, so HTTP(S)_PROXY also
+            # reaches the storage host.
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                async with session.get(
+                    URL(download_url, encoded=True), timeout=aiohttp.ClientTimeout(total=self._timeout)
+                ) as response:
+                    response.raise_for_status()
+                    return await response.read()
         # Fetch the server-provided download_url directly (it carries the raw,
         # slash-bearing storage key). Going through the generated download_file
         # would percent-encode the slashes to %2F, which fronting proxies often
-        # reject. param_serialize applies the client's auth headers; call_api
-        # returns the raw response whose bytes we read (the typed return is
+        # reject. For the API-relative URL, param_serialize applies the client's
+        # auth headers; call_api returns raw bytes (the typed return is
         # `object`, which can't model an application/zip body).
         request = self._api_client.param_serialize(
             method="GET",
@@ -2703,8 +2732,6 @@ class Hindsight:
         return await self._aget_bank_config(bank_id)
 
     async def _aget_bank_config(self, bank_id: str) -> dict[str, Any]:
-        import aiohttp
-
         url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         async with aiohttp.ClientSession() as session:
@@ -2738,11 +2765,13 @@ class Hindsight:
         observations_mission: str | None = None,
         max_observations_per_scope: int | None = None,
         observation_scope_limits: list[dict[str, Any]] | None = None,
+        consolidation_strategies: list[dict[str, Any]] | None = None,
         enable_auto_consolidation: bool | None = None,
         consolidation_llm_parallelism: int | None = None,
         consolidation_max_memories_per_round: int | None = None,
         mental_model_min_refresh_interval_seconds: int | None = None,
         knowledge_page_default_trigger: dict[str, Any] | None = None,
+        reflect_default_options: dict[str, Any] | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2801,11 +2830,13 @@ class Hindsight:
                 observations_mission=observations_mission,
                 max_observations_per_scope=max_observations_per_scope,
                 observation_scope_limits=observation_scope_limits,
+                consolidation_strategies=consolidation_strategies,
                 enable_auto_consolidation=enable_auto_consolidation,
                 consolidation_llm_parallelism=consolidation_llm_parallelism,
                 consolidation_max_memories_per_round=consolidation_max_memories_per_round,
                 mental_model_min_refresh_interval_seconds=mental_model_min_refresh_interval_seconds,
                 knowledge_page_default_trigger=knowledge_page_default_trigger,
+                reflect_default_options=reflect_default_options,
                 enable_text_search=enable_text_search,
                 enable_temporal_retrieval=enable_temporal_retrieval,
                 enable_graph_retrieval=enable_graph_retrieval,
@@ -2861,11 +2892,13 @@ class Hindsight:
         observations_mission: str | None = None,
         max_observations_per_scope: int | None = None,
         observation_scope_limits: list[dict[str, Any]] | None = None,
+        consolidation_strategies: list[dict[str, Any]] | None = None,
         enable_auto_consolidation: bool | None = None,
         consolidation_llm_parallelism: int | None = None,
         consolidation_max_memories_per_round: int | None = None,
         mental_model_min_refresh_interval_seconds: int | None = None,
         knowledge_page_default_trigger: dict[str, Any] | None = None,
+        reflect_default_options: dict[str, Any] | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2930,11 +2963,16 @@ class Hindsight:
                 filterable via ``tags``/``tags_match`` at recall.
             entities_allow_free_form: Whether to allow entity types outside entity_labels (default: True).
             max_observations_per_scope: Cap on observations retained per scope (-1 for unlimited).
-            observation_scope_limits: Per-scope observation caps, overriding max_observations_per_scope.
+            observation_scope_limits: Deprecated; use consolidation_strategies. Per-scope observation caps.
+            consolidation_strategies: Per-scope consolidation settings (mission, observation cap).
             enable_auto_consolidation: Consolidate automatically after retain() rather than on demand.
             consolidation_llm_parallelism: Concurrent LLM calls during consolidation.
             consolidation_max_memories_per_round: Memories consolidated per round.
             mental_model_min_refresh_interval_seconds: Debounce between mental-model refreshes.
+            reflect_default_options: Default reflect options for this bank, applied whenever a
+                reflect request (or a mental model's trigger) leaves the option unset:
+                reflect_search_observations_max_tokens and
+                reflect_search_observations_include_entities.
             knowledge_page_default_trigger: Trigger fields merged over the built-in default for new
                 knowledge pages, e.g. {"refresh_cron": "0 * * * *"}.
             enable_observations: Toggle automatic observation consolidation after retain().
@@ -2994,11 +3032,13 @@ class Hindsight:
                 "observations_mission": observations_mission,
                 "max_observations_per_scope": max_observations_per_scope,
                 "observation_scope_limits": observation_scope_limits,
+                "consolidation_strategies": consolidation_strategies,
                 "enable_auto_consolidation": enable_auto_consolidation,
                 "consolidation_llm_parallelism": consolidation_llm_parallelism,
                 "consolidation_max_memories_per_round": consolidation_max_memories_per_round,
                 "mental_model_min_refresh_interval_seconds": mental_model_min_refresh_interval_seconds,
                 "knowledge_page_default_trigger": knowledge_page_default_trigger,
+                "reflect_default_options": reflect_default_options,
                 "enable_text_search": enable_text_search,
                 "enable_temporal_retrieval": enable_temporal_retrieval,
                 "enable_graph_retrieval": enable_graph_retrieval,
@@ -3031,8 +3071,6 @@ class Hindsight:
         return await self._aupdate_bank_config(bank_id, updates)
 
     async def _aupdate_bank_config(self, bank_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-        import aiohttp
-
         url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         async with aiohttp.ClientSession() as session:
@@ -3065,8 +3103,6 @@ class Hindsight:
         return await self._areset_bank_config(bank_id)
 
     async def _areset_bank_config(self, bank_id: str) -> dict[str, Any]:
-        import aiohttp
-
         url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         async with aiohttp.ClientSession() as session:

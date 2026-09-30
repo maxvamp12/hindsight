@@ -40,6 +40,7 @@ Used for fact extraction, entity resolution, mental model consolidation, and ans
 - Requesty
 - OpenAI Codex
 - Claude Code
+- Cursor
 - GitHub Copilot
 - AWS Bedrock
 - Fireworks AI
@@ -58,16 +59,16 @@ Hindsight works with any provider that exposes an OpenAI-compatible API. Set `HI
 
 The `openai` provider talks to the **Chat Completions API** (`/v1/chat/completions`). For the newer **Responses API** (`/v1/responses`), use `HINDSIGHT_API_LLM_PROVIDER=openai-responses` — see the tip below. Both accept a custom `HINDSIGHT_API_LLM_BASE_URL`, so an OpenAI-compatible endpoint that exposes `/v1/responses` works the same way as a Chat Completions one.
 
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **💡 OpenAI Responses API (reasoning + tools together)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=openai-responses` to call OpenAI's **Responses API** (`/v1/responses`) instead of Chat Completions.
 
-Why it exists: some reasoning models — e.g. `gpt-5.6-terra` — **reject `reasoning_effort` when function tools are present** on Chat Completions (HTTP 400 unless `reasoning_effort="none"`). Reflect is a tool-calling loop, so on the `openai` (Completions) provider that forces the whole operation — including the final synthesis — to run with reasoning disabled. The Responses API keeps the model's chain-of-thought as a first-class reasoning item, so **reasoning and tools coexist**: reflect's search loop runs with a real `HINDSIGHT_API_LLM_REASONING_EFFORT` (e.g. `high`).
+Why it exists: some reasoning models — e.g. `gpt-5.6-terra` — **reject `reasoning_effort` when function tools are present** on Chat Completions (HTTP 400 unless `reasoning_effort="none"`). Reflect is a tool-calling loop, so on the `openai` (Completions) provider that forces the whole operation — including the final synthesis — to run with reasoning disabled. (Hindsight retries that 400 once with `reasoning_effort="none"` so the call still succeeds — but it succeeds without reasoning.) The Responses API keeps the model's chain-of-thought as a first-class reasoning item, so **reasoning and tools coexist**: reflect's search loop runs with a real `HINDSIGHT_API_LLM_REASONING_EFFORT` (e.g. `high`).
 
 Recommended for reasoning models (gpt-5.x, o-series) that use tools. It also honors a custom `HINDSIGHT_API_LLM_BASE_URL`, so any OpenAI-compatible endpoint exposing `/v1/responses` (gateways, Azure-style deployments) can be used just like the Chat Completions path.
 
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **ℹ️ Reasoning/thinking models and `max_tokens`**
 >
 On a thinking model (Gemini 2.5+/3.x, GPT-5/o-series, Grok reasoning, Claude extended thinking) the provider's output budget covers **reasoning tokens plus visible output** — the reasoning is billed against the same `max_output_tokens`/`max_completion_tokens` cap. A small cap can therefore be fully consumed by reasoning, leaving the visible answer truncated mid-word.
@@ -77,26 +78,26 @@ Hindsight keeps the reflect/mental-model `max_tokens` meaning **visible page len
 When a Gemini call does hit its cap, Hindsight logs a `truncated at max_output_tokens` warning instead of returning the half-written text as a silent success.
 > **💡 AWS Bedrock**
 >
-Set `HINDSIGHT_API_LLM_PROVIDER=bedrock` to use AWS Bedrock models directly. Model names use Bedrock model IDs (e.g., `us.amazon.nova-2-lite-v1:0`). No API key is required — authentication uses AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME`) or IAM roles. For 50% cost savings on throughput, set `HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER=flex` (see [Configuration](./configuration#llm-provider)).
+Set `HINDSIGHT_API_LLM_PROVIDER=bedrock` to use AWS Bedrock models directly. Model names use Bedrock model IDs (e.g., `us.amazon.nova-2-lite-v1:0`). No API key is required — authentication uses AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME`) or IAM roles. For 50% cost savings on throughput, set `HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER=flex` (see [Configuration](./configuration.md#llm-provider)).
 
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **💡 Built-in llama.cpp (fully local, no API key)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=llamacpp` to run a built-in llama.cpp server with no external dependencies. A Gemma 4 E2B GGUF model (~3.5 GB) is auto-downloaded on first run. Requires the `local-llm` extra: `pip install 'hindsight-api-slim[local-llm]'`.
 
 The published Docker image does not bundle `llama-cpp-python` (to keep the image small). For a runnable Docker setup that adds it on top, see [`docker/docker-compose/local-llm/`](https://github.com/vectorize-io/hindsight/tree/main/docker/docker-compose/local-llm).
 
-See [Configuration](./configuration#built-in-llamacpp) for all options.
+See [Configuration](./configuration.md#built-in-llamacpp) for all options.
 > **💡 LiteLLM Provider (Azure, Together AI, and more)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=litellm` to use any model supported by [LiteLLM](https://docs.litellm.ai/docs/providers), including **Azure OpenAI**, **Together AI**, **Fireworks AI**, and many more. Model names use LiteLLM's provider prefix format (e.g., `azure/gpt-4o`).
 
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **💡 LiteLLM Router (fallback chains, load-balancing, per-deployment limits)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=litellmrouter` to run the default LLM through [LiteLLM's Router](https://docs.litellm.ai/docs/routing) — ordered fallback across deployments, load-balanced same-tier routing, weighted picks, per-deployment `rpm`/`tpm` limits, and cooldowns are all available via the [`Router` config](https://docs.litellm.ai/docs/routing#fallbacks). Hindsight passes the JSON config through verbatim.
 
-See [Configuration](./configuration#llm-router-litellm-router) for setup.
+See [Configuration](./configuration.md#llm-router-litellm-router) for setup.
 ### Provider Capabilities
 
 Beyond basic generation, some providers support optional features that lower cost or latency. Hindsight uses each feature automatically when the configured provider supports it.
@@ -124,6 +125,7 @@ Beyond basic generation, some providers support optional features that lower cos
 | Requesty (`requesty`) | — | — |
 | OpenAI Codex (`openai-codex`) | — | — |
 | Claude Code (`claude-code`) | — | — |
+| Cursor (`cursor`) | — | — |
 | GitHub Copilot (`github-copilot`) | — | — |
 | AWS Bedrock (`bedrock`) | — | — |
 | Fireworks AI (`fireworks`) | ✅ | — |
@@ -192,6 +194,7 @@ Each provider has a recommended default model that's used when `HINDSIGHT_API_LL
 | `requesty` | `openai/gpt-4o-mini` |
 | `openai-codex` | `gpt-5.4-mini` |
 | `claude-code` | `claude-sonnet-4-5-20250929` |
+| `cursor` | `auto` |
 | `github-copilot` | `gpt-5.6-terra` |
 | `bedrock` | `us.amazon.nova-2-lite-v1:0` |
 | `fireworks` | `accounts/fireworks/models/llama-v3p1-8b-instruct` |
@@ -327,6 +330,13 @@ export HINDSIGHT_API_LLM_PROVIDER=nous
 export HINDSIGHT_API_LLM_MODEL=deepseek/deepseek-v4-flash  # any Nous-hosted slug
 # No API key needed — reads a rotating JWT from ~/.hermes/auth.json (see "Nous Portal Setup" below)
 
+# Cursor subscription via the cursor-agent CLI (no API key — uses `cursor-agent login`)
+export HINDSIGHT_API_LLM_PROVIDER=cursor
+export HINDSIGHT_API_LLM_MODEL=auto  # or any id from `cursor-agent --list-models`
+# An agent CLI turn takes 15-30s — raise the timeouts (see "Cursor Setup" below)
+export HINDSIGHT_API_LLM_TIMEOUT=300
+export HINDSIGHT_API_REFLECT_LLM_TIMEOUT=180
+
 # SuperGrok subscription via device-code OAuth (no API key; the subscription lane, not
 # xAI API support — for an api.x.ai API key use `openai` with a base URL instead)
 export HINDSIGHT_API_LLM_PROVIDER=xai-oauth
@@ -343,7 +353,7 @@ export HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=your-gcp-project-id
 # export HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/path/to/key.json
 ```
 
-**Note:** The LLM is the primary bottleneck for retain operations. See [Performance](./performance) for optimization strategies.
+**Note:** The LLM is the primary bottleneck for retain operations. See [Performance](./performance.md) for optimization strategies.
 
 ---
 
@@ -476,7 +486,7 @@ resolves the same `auth.json`. To run more than one independently authorized
 ChatGPT account — for example, to fail over when the preferred account hits its
 usage limit — give each one its own credentials directory with
 `HINDSIGHT_API_LLM_CODEX_HOME` (primary) and `HINDSIGHT_API_LLM_<n>_CODEX_HOME`
-(indexed [multi-LLM chain](./configuration#multi-llm-strategies-failover--round-robin)
+(indexed [multi-LLM chain](./configuration.md#multi-llm-strategies-failover--round-robin)
 members). Each falls back to `CODEX_HOME`, then `~/.codex`, when unset.
 
 ```bash
@@ -660,6 +670,78 @@ You can use any model supported by Claude Code CLI.
 
 ---
 
+### Cursor Setup (Cursor subscription)
+
+Serve Hindsight's extraction, consolidation and reflection calls from a **Cursor
+subscription**, by driving the `cursor-agent` CLI in its headless print mode. No API key
+and no second per-token billing relationship.
+
+This is the opposite direction from the [Cursor integration](../sdks/integrations/cursor.md),
+which makes Cursor a *client* of Hindsight. Here Cursor is the model backend Hindsight calls.
+
+**Prerequisites:**
+- An active Cursor subscription (a free plan works, but only with `auto` — see below)
+- `cursor-agent` installed and signed in under the same OS user that runs Hindsight
+
+**Setup Steps:**
+
+1. **Install the CLI:**
+   ```bash
+   curl https://cursor.com/install -fsS | bash
+   ```
+
+2. **Log in:**
+   ```bash
+   cursor-agent login
+   ```
+
+3. **Verify:**
+   ```bash
+   cursor-agent --version
+   cursor-agent --list-models
+   ```
+
+4. **Configure Hindsight:**
+   ```bash
+   export HINDSIGHT_API_LLM_PROVIDER=cursor
+   export HINDSIGHT_API_LLM_MODEL=auto
+   # An agent CLI turn takes 15-30s, well past the 30s reflect default.
+   export HINDSIGHT_API_LLM_TIMEOUT=300
+   export HINDSIGHT_API_REFLECT_LLM_TIMEOUT=180
+   # No API key needed. To authenticate with a key instead:
+   # export HINDSIGHT_API_LLM_API_KEY=...   # or CURSOR_API_KEY
+   ```
+
+**Important notes:**
+
+- **Raise the timeouts.** Each call spawns a `cursor-agent` turn, which takes 15-30s
+  against `auto` — slower than a chat-completions request and past the 30s
+  `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` default. Left at the default, reflect spends its
+  first iteration on timeout retries before recovering.
+- **Structured output and tool calling are prompt-level emulations.** The CLI exposes no
+  `response_format`, JSON-schema, temperature or tool-definition flag — only
+  `--output-format text|json|stream-json`, which describes the envelope. Hindsight puts
+  the schema (or the tool list) in the prompt and parses the model's JSON back out,
+  retrying on a parse failure. That is less reliable than a native schema, so prefer a
+  strong named model over `auto` for reflect, the operation that leans hardest on tools.
+- **Free plans are limited to `auto`.** A named `--model` returns
+  `Named models unavailable Free plans can only use Auto`. Paid plans can use any id from
+  `cursor-agent --list-models`.
+- **The agent's own tools are turned off.** `cursor-agent` is an agent, not a completions
+  endpoint: it ships Shell, Read, Write, Delete, web fetch and more, and `--mode ask` is
+  *not* a tool switch — a headless run in ask mode will still read files out of its
+  working directory. Hindsight therefore runs the CLI in an empty scratch workspace, with
+  its own `CURSOR_CONFIG_DIR` (so it never sees your `~/.cursor` config, hooks or session
+  history), and writes a `cli-config.json` there that denies every tool by name. That is
+  the equivalent of the `tools=[]` the `claude-code` provider passes its SDK, and it
+  matters because retain prompts are built from whatever text you store in Hindsight.
+- Usage counts against your Cursor subscription.
+- Reasoning effort is not supported — the CLI has no such flag, and Hindsight warns once
+  at startup if `HINDSIGHT_API_LLM_REASONING_EFFORT` is set.
+- Embeddings and reranking continue to use Hindsight's separately configured providers.
+
+---
+
 ### SuperGrok Subscription Setup (device-code OAuth)
 
 Serve LLM calls from a **SuperGrok subscription** (device-code OAuth) — no API
@@ -806,7 +888,7 @@ export HINDSIGHT_API_LLM_BASE_URL=https://<resource>.openai.azure.com/openai/dep
   routing on GPT-5.6 and later), but the same `*.openai.azure.com` endpoint also
   serves non-OpenAI Foundry models (DeepSeek, Llama, Mistral) that reject it with
   `unrecognized_request_argument`. The host alone can't tell the two apart, so
-  [`HINDSIGHT_API_LLM_CACHE_AFFINITY`](./configuration#llm-provider) resolves
+  [`HINDSIGHT_API_LLM_CACHE_AFFINITY`](./configuration.md#llm-provider) resolves
   `auto` to `none` for Azure hosts. If your deployment serves an OpenAI model,
   set it explicitly to `openai_prompt_cache_key`.
 
@@ -1005,7 +1087,7 @@ The two are separate because Bedrock's embedding request and response formats di
 
 Chat models don't need this: set `HINDSIGHT_API_LLM_MODEL=bedrock/converse/<arn>`, since the Converse API takes one format for every model.
 
-See [Configuration](./configuration#embeddings) for all options including Azure OpenAI and custom endpoints.
+See [Configuration](./configuration.md#embeddings) for all options including Azure OpenAI and custom endpoints.
 
 For a runnable Docker Compose setup that serves both embeddings and reranking from self-hosted TEI sidecars, see [`docker/docker-compose/tei/`](https://github.com/vectorize-io/hindsight/tree/main/docker/docker-compose/tei).
 
@@ -1026,6 +1108,7 @@ Reranks initial search results to improve precision.
 | `openrouter` | OpenRouter rerank API (Cohere-compatible gateway) | Multi-provider setups |
 | `zeroentropy` | ZeroEntropy rerank API (zerank-2) | Production, state-of-the-art accuracy |
 | `siliconflow` | SiliconFlow rerank API (Cohere-compatible `/rerank` endpoint) | Users in China or anyone on SiliconFlow's platform |
+| `typesafe` | TypeSafe typed-decision API (Jev) — ranks the whole pool in one question | Production, highest ranking quality; can also return only the relevant candidates |
 | `alibaba` | Alibaba Cloud DashScope rerank API (qwen3-rerank) | Users on Alibaba Cloud / DashScope |
 | `google` | Google Discovery Engine ranking API (REST + Google auth) | Production, GCP integration |
 | `tei` | HuggingFace Text Embeddings Inference | Production, self-hosted |
@@ -1065,6 +1148,25 @@ SiliconFlow hosts a range of open-weight rerankers behind a Cohere-compatible `/
 |-------|----------|
 | `BAAI/bge-reranker-v2-m3` | Multilingual, strong default |
 | `Qwen/Qwen3-Reranker-8B` | Larger, higher accuracy |
+
+### TypeSafe Models
+
+TypeSafe is not a `/rerank` endpoint — it answers typed *questions* against a *state*.
+Hindsight makes the candidates the options of a Choice question, so the returned
+probability distribution is the ranking. When the candidate pool fits within the 250-option
+limit and context token budget, a single call ranks the entire pool. Larger pools or pools
+with long documents are partitioned into groups whose top candidates advance to a finals
+ranking round, with token truncation applied to fit context windows.
+
+| Model | Use Case |
+|-------|----------|
+| `jev-latest` | Default; tracks the current Jev release |
+
+Setting `HINDSIGHT_API_RERANKER_TYPESAFE_PRUNE_CANDIDATES=true` adds a second question
+that cuts the ranked list where relevance ends, so recall returns the relevant
+candidates and nothing else. It is off by default because it meaningfully shrinks what
+recall returns. See [Configuration](configuration.md#typesafe) for the full
+behaviour and its trade-offs.
 
 ### Alibaba Cloud Models
 
@@ -1119,6 +1221,12 @@ export HINDSIGHT_API_RERANKER_PROVIDER=siliconflow
 export HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY=your-api-key
 export HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL=BAAI/bge-reranker-v2-m3  # default, can omit
 
+# TypeSafe (typed-decision API, ranks the whole pool in one question)
+export HINDSIGHT_API_RERANKER_PROVIDER=typesafe
+export HINDSIGHT_API_RERANKER_TYPESAFE_API_KEY=your-api-key
+export HINDSIGHT_API_RERANKER_TYPESAFE_MODEL=jev-latest  # default, can omit
+# export HINDSIGHT_API_RERANKER_TYPESAFE_PRUNE_CANDIDATES=true  # return only the relevant ones
+
 # Alibaba Cloud DashScope (qwen3-rerank)
 export HINDSIGHT_API_RERANKER_PROVIDER=alibaba
 export HINDSIGHT_API_RERANKER_ALIBABA_API_KEY=your-dashscope-api-key
@@ -1140,4 +1248,4 @@ export HINDSIGHT_API_RERANKER_LITELLM_MODEL=cohere/rerank-english-v3.0
 export HINDSIGHT_API_RERANKER_PROVIDER=rrf
 ```
 
-See [Configuration](./configuration#reranker) for all options including Azure-hosted endpoints and batch settings.
+See [Configuration](./configuration.md#reranker) for all options including Azure-hosted endpoints and batch settings.
