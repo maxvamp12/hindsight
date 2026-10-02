@@ -18,6 +18,24 @@ import pytest
 from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult
 from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
+
+
+class FakeConn:
+    async def fetch(self, query, *params):
+        self.last_query = query
+        return []
+
+class FakeStore:
+    async def expand_memories(self, **kwargs):
+        import uuid as _uuid
+        return [
+            {"id": _uuid.UUID("11111111-1111-1111-1111-111111111111"), "text": "in window",
+             "chunk_id": None, "document_id": None, "fact_type": "world",
+             "context": "", "tags": [], "updated_at": INSIDE_TS},
+            {"id": _uuid.UUID("22222222-2222-2222-2222-222222222222"), "text": "stale",
+             "chunk_id": None, "document_id": None, "fact_type": "world",
+             "context": "", "tags": [], "updated_at": OUTSIDE_TS},
+        ]
 from hindsight_api.engine.reflect.agent import run_reflect_agent
 
 
@@ -159,3 +177,68 @@ class TestEvidenceBudgetComposition:
         tool_msg = mock_llm.call_with_tools.await_args_list[0].kwargs["messages"][-1]
         assert "_truncated" not in tool_msg["content"]
         assert '"f1"' in tool_msg["content"]  # presenter still applied
+
+    @pytest.mark.asyncio
+    async def test_expand_honours_temporal_window_arguments(self, monkeypatch):
+        """tool_expand accepts created_after/created_before and drops memories whose
+        updated_at sits outside the window — the regression that started as an
+        unnoticed TypeError in the original PR (the params were forwarded to a
+        function that did not accept them)."""
+        from datetime import datetime, timezone
+        from hindsight_api.engine.reflect.tools import tool_expand
+
+        seen_kwargs = {}
+
+        class FakeConn:
+            async def fetch(self, query, *params):
+                seen_kwargs["query"] = query
+                return []
+
+        # Patch store expansion: return two memories, one inside the window, one outside.
+        inside_ts = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
+        outside_ts = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+        class FakeStore:
+            async def expand_memories(self, **kwargs):
+                return [
+                    {"id": "11111111-1111-1111-1111-111111111111", "text": "in window",
+                     "chunk_id": None, "document_id": None, "fact_type": "world",
+                     "context": "", "tags": [], "updated_at": inside_ts},
+                    {"id": "22222222-2222-2222-2222-222222222222", "text": "stale",
+                     "chunk_id": None, "document_id": None, "fact_type": "world",
+                     "context": "", "tags": [], "updated_at": outside_ts},
+                ]
+
+        import hindsight_api.engine.memories as memories_pkg
+
+        async def fake_expand_memories(self, **kw):
+            return [
+                {"id": "11111111-1111-1111-1111-111111111111", "text": "in window",
+                 "chunk_id": None, "document_id": None, "fact_type": "world",
+                 "context": "", "tags": [], "updated_at": inside_ts},
+                {"id": "22222222-2222-2222-2222-222222222222", "text": "stale",
+                 "chunk_id": None, "document_id": None, "fact_type": "world",
+                 "context": "", "tags": [], "updated_at": outside_ts},
+            ]
+
+        import hindsight_api.engine.memories as _m
+        monkeypatch.setattr(_m, "_memories", FakeStore())
+
+        result = await tool_expand(
+            conn=FakeConn(),
+            bank_id="b",
+            memory_ids=["11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222"],
+            depth="chunk",
+            tags=None, tags_match="any", tag_groups=None,
+            created_after=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        )
+        # Outside-window memories are filtered: they come back as "not found"-style
+        # error entries, while the in-window one returns its full record.
+        by_id = {r["memory_id"]: r for r in result["results"]}
+        assert "memory" in by_id["11111111-1111-1111-1111-111111111111"]
+        assert "error" in by_id["22222222-2222-2222-2222-222222222222"]
+
+        # And the SQL now selects the updated_at column the filter relies on.
+        assert "updated_at" in seen_kwargs["query"]
+

@@ -323,6 +323,51 @@ jobs:
     - name: Check integration lockfiles resolve from the npm registry
       run: ./scripts/check-integration-lockfiles.sh
 
+  typecheck-api:
+    # `ty check` over hindsight-api-slim. Green today, and it stays green: the rules it enforces
+    # are listed in `[tool.ty.rules]`, with the ones not yet clean marked "ignore" there rather
+    # than silenced here, so this job and a local `uv run ty check` always agree.
+    #
+    # Today that is `invalid-argument-type` -- a call passing the wrong type to a declared
+    # parameter. Python does not enforce annotations and a dataclass does not validate at
+    # construction, so without this such a call runs fine until the value is used, which can be
+    # in another process entirely.
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # Same install as `test-api`, `--all-extras` included, and that is load-bearing rather than
+    # copy-paste: a checker only knows a third-party call's types if the package is installed.
+    # Without the extras, `mlx`, `oracledb` and the parser stack resolve to `Unknown`, every call
+    # into them becomes unverifiable, and the rule passes by knowing nothing -- which looks
+    # identical to passing by being correct.
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: ty check
+      working-directory: ./hindsight-api-slim
+      run: uv run ty check
+
   build-api-python-versions:
     needs: [detect-changes]
     if: >-
