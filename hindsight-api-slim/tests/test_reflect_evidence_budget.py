@@ -181,64 +181,55 @@ class TestEvidenceBudgetComposition:
     @pytest.mark.asyncio
     async def test_expand_honours_temporal_window_arguments(self, monkeypatch):
         """tool_expand accepts created_after/created_before and drops memories whose
-        updated_at sits outside the window — the regression that started as an
-        unnoticed TypeError in the original PR (the params were forwarded to a
-        function that did not accept them)."""
+        updated_at sits outside the window — completing the window-consistency fix:
+        recall and search_observations honour the window, and now expand does too."""
+        import uuid as uuid_mod
         from datetime import datetime, timezone
         from hindsight_api.engine.reflect.tools import tool_expand
 
-        seen_kwargs = {}
+        inside_ts = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
+        outside_ts = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+        id_in, id_out = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+        seen_queries = []
 
         class FakeConn:
             async def fetch(self, query, *params):
-                seen_kwargs["query"] = query
+                seen_queries.append(query)
                 return []
-
-        # Patch store expansion: return two memories, one inside the window, one outside.
-        inside_ts = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
-        outside_ts = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
 
         class FakeStore:
             async def expand_memories(self, **kwargs):
                 return [
-                    {"id": "11111111-1111-1111-1111-111111111111", "text": "in window",
-                     "chunk_id": None, "document_id": None, "fact_type": "world",
-                     "context": "", "tags": [], "updated_at": inside_ts},
-                    {"id": "22222222-2222-2222-2222-222222222222", "text": "stale",
-                     "chunk_id": None, "document_id": None, "fact_type": "world",
-                     "context": "", "tags": [], "updated_at": outside_ts},
+                    {"id": uuid_mod.UUID(id_in), "text": "in window", "chunk_id": None,
+                     "document_id": None, "fact_type": "world", "context": "", "tags": [],
+                     "updated_at": inside_ts},
+                    {"id": uuid_mod.UUID(id_out), "text": "stale", "chunk_id": None,
+                     "document_id": None, "fact_type": "world", "context": "", "tags": [],
+                     "updated_at": outside_ts},
                 ]
 
         import hindsight_api.engine.memories as memories_pkg
-
-        async def fake_expand_memories(self, **kw):
-            return [
-                {"id": "11111111-1111-1111-1111-111111111111", "text": "in window",
-                 "chunk_id": None, "document_id": None, "fact_type": "world",
-                 "context": "", "tags": [], "updated_at": inside_ts},
-                {"id": "22222222-2222-2222-2222-222222222222", "text": "stale",
-                 "chunk_id": None, "document_id": None, "fact_type": "world",
-                 "context": "", "tags": [], "updated_at": outside_ts},
-            ]
-
-        import hindsight_api.engine.memories as _m
-        monkeypatch.setattr(_m, "_memories", FakeStore())
+        monkeypatch.setattr(memories_pkg, "_memories", FakeStore())
 
         result = await tool_expand(
             conn=FakeConn(),
             bank_id="b",
-            memory_ids=["11111111-1111-1111-1111-111111111111",
-                        "22222222-2222-2222-2222-222222222222"],
+            memory_ids=[id_in, id_out],
             depth="chunk",
             tags=None, tags_match="any", tag_groups=None,
             created_after=datetime(2026, 9, 1, tzinfo=timezone.utc),
         )
-        # Outside-window memories are filtered: they come back as "not found"-style
+        # Outside-window memories are window-filtered: they surface as "not found"
         # error entries, while the in-window one returns its full record.
         by_id = {r["memory_id"]: r for r in result["results"]}
-        assert "memory" in by_id["11111111-1111-1111-1111-111111111111"]
-        assert "error" in by_id["22222222-2222-2222-2222-222222222222"]
+        assert "memory" in by_id[id_in]
+        assert "error" in by_id[id_out]
 
-        # And the SQL now selects the updated_at column the filter relies on.
-        assert "updated_at" in seen_kwargs["query"]
+        # And the real expand SQL selects the updated_at column the filter relies on.
+        from hindsight_api.engine.memories.pg import expand as pg_expand
 
+        sql_conn = FakeConn()
+        await pg_expand.expand_memories(
+            conn=sql_conn, fq_table=lambda t: t, bank_id="b", unit_ids=[]
+        )
+        assert "updated_at" in seen_queries[0]
